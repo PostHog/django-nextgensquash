@@ -96,15 +96,24 @@ class Config:
     # is not a node on a clean tree. Only swappable-target apps need this.
     stub_claims: dict[str, tuple[tuple[str, str], ...]] = field(default_factory=dict)
 
+    # Module that provides AddFieldIfMissing, AddIndexIfMissing,
+    # AddConstraintIfMissing, and AlterUniqueTogetherIfMissing. Generated
+    # finalize files import it by path wherever migrations run. Point it at a
+    # copy of `nextgensquash/operations.py` inside the project to keep the
+    # package a dev-only tool.
+    operations_module: str = "nextgensquash.operations"
+
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> Config:
         """Build a Config from the `NEXTGENSQUASH` settings dict.
 
         Keys: IGNORED_APPS (list of app labels), FROZEN_APPS (list of app
         labels), EARLY_MODELS (app label -> list of lowercase model names),
-        STUB_CLAIMS (app label -> list of (app, migration name) pairs).
+        STUB_CLAIMS (app label -> list of (app, migration name) pairs),
+        OPERATIONS_MODULE (dotted module path, see `operations_module`).
         """
-        unknown = sorted(set(raw) - {"IGNORED_APPS", "FROZEN_APPS", "EARLY_MODELS", "STUB_CLAIMS"})
+        known = {"IGNORED_APPS", "FROZEN_APPS", "EARLY_MODELS", "STUB_CLAIMS", "OPERATIONS_MODULE"}
+        unknown = sorted(set(raw) - known)
         if unknown:
             raise ImproperlyConfigured(f"unknown {SETTINGS_KEY} key(s): {', '.join(unknown)}")
         return cls(
@@ -115,6 +124,7 @@ class Config:
                 app: tuple((str(a), str(n)) for a, n in claims)
                 for app, claims in (raw.get("STUB_CLAIMS") or {}).items()
             },
+            operations_module=raw.get("OPERATIONS_MODULE") or cls.operations_module,
         )
 
     @classmethod

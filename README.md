@@ -15,10 +15,16 @@ Django's own `squashmigrations` does not work at this scale. It squashes one app
 ## Install
 
 ```bash
-pip install django-nextgensquash
+uv add django-nextgensquash
 ```
 
-The generated `finalize_fks` files import `nextgensquash.operations` at migrate time. The package must therefore be installed wherever migrations run - CI, dev machines, and production - not only where you generate them. Once you install a squash it is a runtime dependency of your project, not a dev tool.
+The generated `finalize_fks` files import the idempotent operations by module path at migrate time. By default that path is `nextgensquash.operations`, which makes the package a runtime dependency of your project: it must be installed wherever migrations run, not only where you generate them.
+
+To keep the package a dev-only tool instead, copy `src/nextgensquash/operations.py` into your project and point `OPERATIONS_MODULE` at it (see below). The generated files then import your copy, and the tool itself can run from an ephemeral environment:
+
+```bash
+uv run --with git+https://github.com/PostHog/django-nextgensquash python -m nextgensquash plan --cutoff 2026-08-21
+```
 
 ## Configuration
 
@@ -49,6 +55,11 @@ NEXTGENSQUASH = {
     # be parentless, and must be a node that exists in the emit-time graph.
     # Only swappable-target apps need this.
     "STUB_CLAIMS": {"myapp": [["myapp", "0001_initial_squashed_0284_caching"]]},
+
+    # Module the generated finalize files import for AddFieldIfMissing and
+    # friends. Defaults to "nextgensquash.operations"; point it at an in-project
+    # copy of that module to avoid a runtime dependency on this package.
+    "OPERATIONS_MODULE": "myapp.migration_helpers.squash_operations",
 }
 ```
 

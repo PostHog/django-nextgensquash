@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib
 import re
 import sys
 from collections.abc import Iterator
@@ -21,7 +22,7 @@ from django.db.migrations.loader import MigrationLoader
 from django.db.migrations.state import ProjectState
 from django.db.migrations.writer import MigrationWriter
 
-from nextgensquash import cyclebreak, operations, planning
+from nextgensquash import cyclebreak, planning
 from nextgensquash.config import Config
 
 
@@ -115,6 +116,9 @@ class Emitter:
         self.app = app
         self.cycle_breaker = cycle_breaker
         self.config = config
+        # The generated finalize files import these classes by module path,
+        # so a project can point at its own copy and skip a runtime dependency.
+        self.operations = importlib.import_module(config.operations_module)
         # One loader serves every collector; rebuilding the full graph per
         # method per app cost tens of seconds across a whole emit run.
         self.loader = loader if loader is not None else MigrationLoader(connection=None, ignore_no_migrations=True)
@@ -815,7 +819,7 @@ class Emitter:
             if field is None:
                 continue
             addfield_ops.append(
-                operations.AddFieldIfMissing(
+                self.operations.AddFieldIfMissing(
                     model_name=fk.from_model,
                     name=fk.field_name,
                     field=field,
@@ -824,14 +828,14 @@ class Emitter:
             finalize_dep_apps.add(fk.to_app)
         # Re-add any indexes/constraints we lifted out of the initial CreateModels.
         for model_name, idx in deferred_indexes:
-            addfield_ops.append(operations.AddIndexIfMissing(model_name=model_name, index=idx))
+            addfield_ops.append(self.operations.AddIndexIfMissing(model_name=model_name, index=idx))
         for model_name, c in deferred_constraints:
-            addfield_ops.append(operations.AddConstraintIfMissing(model_name=model_name, constraint=c))
+            addfield_ops.append(self.operations.AddConstraintIfMissing(model_name=model_name, constraint=c))
         # Restore the full unique_together / index_together sets now that every
         # deferred field exists.
         for model_name, key, full in deferred_togethers:
             if key == "unique_together":
-                addfield_ops.append(operations.AlterUniqueTogetherIfMissing(name=model_name, unique_together=full))
+                addfield_ops.append(self.operations.AlterUniqueTogetherIfMissing(name=model_name, unique_together=full))
             else:
                 raise RuntimeError(f"index_together deferral for {model_name} has no idempotent emitter")
 

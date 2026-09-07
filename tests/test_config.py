@@ -13,6 +13,7 @@ def test_from_dict_reads_every_key():
             "FROZEN_APPS": ["queue"],
             "EARLY_MODELS": {"core": ["instancesetting"]},
             "STUB_CLAIMS": {"core": [["core", "0001_initial"]]},
+            "OPERATIONS_MODULE": "core.squash_operations",
         }
     )
 
@@ -20,6 +21,7 @@ def test_from_dict_reads_every_key():
     assert config.frozen_apps == frozenset({"queue"})
     assert config.early_models == {"core": frozenset({"instancesetting"})}
     assert config.stub_claims == {"core": (("core", "0001_initial"),)}
+    assert config.operations_module == "core.squash_operations"
 
 
 @pytest.mark.parametrize("raw", [{}, {"IGNORED_APPS": None, "STUB_CLAIMS": None}])
