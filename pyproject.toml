@@ -1,0 +1,75 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "django-nextgensquash"
+version = "0.1.0"
+description = "Propose, emit, install, and retire a from-scratch squash of pre-cutoff Django migrations."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "PostHog" }]
+keywords = ["django", "migrations", "squash"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Framework :: Django",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Topic :: Database",
+]
+dependencies = [
+    "Django>=4.2",
+    "networkx>=3.0",
+    "PyYAML>=6.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.16,<0.17",
+    "mypy>=1.11",
+    "django-stubs>=5.0",
+    "types-PyYAML>=6.0",
+    "types-networkx>=3.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/PostHog/django-nextgensquash"
+Source = "https://github.com/PostHog/django-nextgensquash"
+
+[project.scripts]
+nextgensquash = "nextgensquash.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/nextgensquash"]
+
+[tool.ruff]
+line-length = 120
+src = ["src", "tests"]
+# The README is prose, not source; keep the formatter out of its code blocks.
+extend-exclude = ["*.md"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+# The formatter owns line length; it cannot split long strings, and E501 would
+# only flag lines it has already decided to leave alone.
+ignore = ["E501"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["nextgensquash"]
+
+[tool.mypy]
+python_version = "3.11"
+files = ["src"]
+check_untyped_defs = true
+disallow_incomplete_defs = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+warn_unused_configs = true
+strict_equality = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
