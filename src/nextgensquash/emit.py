@@ -54,10 +54,11 @@ class Emitter:
 
     Emits 0000_squash_stub when the app needs one (extensions, early models,
     the __first__ anchor) and 0001_squash_<cutoff>_initial (CreateModel per
-    model, full replaces=). Adds 0002_squash_<cutoff>_finalize_fks when FK fields, indexes,
-    constraints, or unique_together tuples were deferred to break cycles, and
-    0003_squash_<cutoff>_schema_addons when claimed migrations carry RunSQL
-    index or constraint DDL the CreateModel walk cannot reproduce.
+    model, full replaces=). Adds <tip+1>_squash_<cutoff>_finalize_fks when FK
+    fields, indexes, constraints, or unique_together tuples were deferred to
+    break cycles, and <tip+2>_squash_<cutoff>_schema_addons when claimed
+    migrations carry RunSQL index or constraint DDL the CreateModel walk cannot
+    reproduce. See `tail_names` for the numbering.
     """
 
     # Stable across phases — content is just extensions + standalone early
@@ -74,13 +75,25 @@ class Emitter:
     def INITIAL_NAME(self) -> str:
         return f"0001_squash_{self._date_token}_initial"
 
+    # The tail files are the app's graph leaf, and Django numbers the next
+    # makemigrations output from the leaf. Numbering them after the app's
+    # current tip keeps the sequence going (1343, 1344, then a dev's 1345)
+    # instead of restarting at 0004. The addons number is always tip + 2 so
+    # every caller can compute it without knowing whether finalize exists.
+    def tail_names(self, app: str) -> tuple[str, str]:
+        base = self.squasher.max_number(app)
+        return (
+            f"{base + 1:04d}_squash_{self._date_token}_finalize_fks",
+            f"{base + 2:04d}_squash_{self._date_token}_schema_addons",
+        )
+
     @property
     def FINALIZE_NAME(self) -> str:
-        return f"0002_squash_{self._date_token}_finalize_fks"
+        return self.tail_names(self.app)[0]
 
     @property
     def SCHEMA_ADDONS_NAME(self) -> str:
-        return f"0003_squash_{self._date_token}_schema_addons"
+        return self.tail_names(self.app)[1]
 
     # RunSQL ops in claimed migrations sometimes create indexes that aren't
     # declared in `Meta.indexes` (partial WHERE clauses, GIN with custom
@@ -635,7 +648,6 @@ class Emitter:
         added yet.
         """
         deps: set[tuple[str, str]] = {(self.app, prior_squash)}
-        date_token = self._date_token
         # Emit skips claimed apps with no models left in the final state (all
         # moved away, e.g. llm_analytics) — no squash file exists for them, so
         # no dep may point at one.
@@ -645,7 +657,7 @@ class Emitter:
                 continue
             # Match the post-emit naming convention; see INITIAL_NAME / FINALIZE_NAME.
             has_finalize = bool(self.cycle_breaker.deferred_for_app(app))
-            leaf = f"0002_squash_{date_token}_finalize_fks" if has_finalize else f"0001_squash_{date_token}_initial"
+            leaf = self.tail_names(app)[0] if has_finalize else self.INITIAL_NAME
             deps.add((app, leaf))
         return sorted(deps)
 

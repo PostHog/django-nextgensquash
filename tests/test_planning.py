@@ -125,3 +125,19 @@ def test_min_young_keeps_a_run_before_source_folded(make_migration):
 
     assert ("other", "0002_backfill") in squasher.old
     assert ("core", "0002_target") in squasher.young
+
+
+def test_max_number_ignores_unnumbered_names(make_migration):
+    migrations = [
+        make_migration("core", "0001_initial", commit_date=OLD_DATE),
+        make_migration("core", "1342_latest", commit_date=YOUNG_DATE),
+        make_migration("core", "squashed_legacy", commit_date=OLD_DATE),
+        make_migration("other", "0007_thing", commit_date=OLD_DATE),
+    ]
+    tree = loading.MigrationTree({m.ref.key: m for m in migrations}, Config())
+
+    squasher = planning.Squasher(tree, CUTOFF, min_young=0)
+
+    assert squasher.max_number("core") == 1342
+    assert squasher.max_number("other") == 7
+    assert squasher.max_number("missing") == 0

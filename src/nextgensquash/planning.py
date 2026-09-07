@@ -95,6 +95,15 @@ class Squasher:
                 self.young[m.ref.key] = m
                 need -= 1
 
+    def max_number(self, app: str) -> int:
+        """Highest numeric prefix among the app's migrations, old and young; 0 when none."""
+        numbers = [
+            int(m.ref.name.split("_", 1)[0])
+            for m in self.tree.migrations.values()
+            if m.ref.app == app and m.ref.name.split("_", 1)[0].isdigit()
+        ]
+        return max(numbers, default=0)
+
     def _runs_before_old(self, m: loading.Migration) -> bool:
         """True when `run_before` names a folded migration. A young node that must
         run before the squash closes a cycle through the replaces redirect."""
