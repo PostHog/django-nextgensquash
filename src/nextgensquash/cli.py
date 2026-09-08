@@ -73,16 +73,17 @@ def _run_emit(args: argparse.Namespace, config: Config) -> None:
     written: list[Path] = []
     dropped_runsql: list[str] = []
     # Retire manifest collected as we emit. Each replaced name maps to its owning
-    # app; per-app we record both the pre-finalize leaf (where models are CREATED)
-    # and the post-finalize leaf (where deferred FKs / indexes are wired). The
-    # retire pass uses pre-finalize for cross-app references and post-finalize
-    # for same-app references — using post-finalize cross-app would re-introduce
-    # the cycle that finalize_fks itself depends on.
+    # app and to the node that replaced it — the app's initial, or the stub for
+    # the root nodes a stub claims. `leaves` is informational: retire points every
+    # rewritten dependency at the replacement node, the way Django's own loader
+    # remaps it.
     retire_manifest: dict[str, Any] = {
         "cutoff": args.cutoff.isoformat(),
         "leaves": {},  # app -> post-finalize leaf name
         "initials": {},  # app -> pre-finalize (initial) squash name
+        "stubs": {},  # app -> stub name, for the apps that emit one
         "replaced": {},  # "app/name" -> app  (every name claimed by a squash)
+        "claimed_to_stub": {},  # "app/name" -> stub name, for the stub's own claims
     }
     for app in apps:
         emitter = emit.Emitter(state, squasher, app, cycle_breaker, config, loader)
@@ -117,6 +118,14 @@ def _run_emit(args: argparse.Namespace, config: Config) -> None:
             retire_manifest["leaves"][app] = emitter.INITIAL_NAME
         for replaced_app, replaced_name in initial.replaces:
             retire_manifest["replaced"][f"{replaced_app}/{replaced_name}"] = replaced_app
+        stub = next((sq for sq in squashes if sq.name == emitter.STUB_NAME), None)
+        if stub is not None:
+            retire_manifest["stubs"][app] = stub.name
+            # The stub's claims are moved out of the initial's replaces, so
+            # nothing else in the manifest would mention them.
+            for claimed_app, claimed_name in stub.replaces:
+                retire_manifest["replaced"][f"{claimed_app}/{claimed_name}"] = claimed_app
+                retire_manifest["claimed_to_stub"][f"{claimed_app}/{claimed_name}"] = stub.name
     # Save cycle-break edge-removal list as a sidecar for `install` to act on.
     if cycle_edges or run_before_edges:
         edges_file = args.output_dir / "CYCLE_EDGE_REMOVALS.txt"
@@ -213,7 +222,7 @@ def main() -> None:
     parser_retire = subparsers.add_parser(
         "retire",
         parents=[common],
-        help="Canonical Django retirement: rewrite young-migration deps to squash leaves, "
+        help="Canonical Django retirement: rewrite young-migration deps to the squashes, "
         "empty replaces=[], and delete the replaced files on disk.",
     )
     parser_retire.add_argument("--input-dir", type=Path, required=True)

@@ -1,4 +1,4 @@
-"""Canonical Django retirement: rewrite deps to squash leaves, empty replaces, delete replaced files."""
+"""Canonical Django retirement: rewrite deps to the squashes, empty replaces, delete replaced files."""
 
 from __future__ import annotations
 
@@ -83,16 +83,18 @@ def transform_dependencies(
 
 def _rewrite_deps_in_file(
     path: Path,
-    owning_app: str,
     replaced_to_app: dict[str, str],
     initials: dict[str, str],
-    leaves: dict[str, str],
+    claimed_to_stub: dict[str, str],
 ) -> bool:
-    """Rewrite every dep on a now-folded migration to the right squash file.
+    """Rewrite every dep on a now-folded migration to the node that replaced it.
 
-    Same-app references → the post-finalize leaf, so young migrations layer
-    above finalize_fks. Cross-app references → the pre-finalize initial,
-    avoiding the cycle finalize_fks itself depends on.
+    Django's loader remaps a dependency on a replaced node to its replacement,
+    and retire mirrors that: same-app and cross-app references alike go to the
+    app's initial, or to the stub for the names the stub claims. Pointing a
+    same-app reference at the post-finalize leaf instead builds the cycle
+    young → leaf → young, because the tail depends on the app's last young
+    migration to keep the app at a single leaf.
     """
 
     def transform(dep: tuple[str, str]) -> tuple[str, str]:
@@ -100,8 +102,8 @@ def _rewrite_deps_in_file(
         if key not in replaced_to_app:
             return dep
         target_app = replaced_to_app[key]
-        new_name = leaves[target_app] if target_app == owning_app else initials[target_app]
-        return (target_app, new_name)
+        stub_name = claimed_to_stub.get(key)
+        return (target_app, stub_name if stub_name is not None else initials[target_app])
 
     return transform_dependencies(path, transform)
 
@@ -121,10 +123,9 @@ def _run_retire(args: argparse.Namespace) -> None:
 
     Reads RETIRE_MANIFEST.json from the original emit dir, rewrites every
     `dependencies=[…]` entry that names a now-folded migration to point at the
-    correct squash leaf (post-finalize for same-app, pre-finalize for cross-app),
-    empties `replaces=[]` on the squashes, and deletes the replaced files on
-    disk. Use this only once the squash has been applied in every environment
-    that depends on this repo — per Django's docs.
+    squash that replaced it, empties `replaces=[]` on the squashes, and deletes
+    the replaced files on disk. Use this only once the squash has been applied
+    in every environment that depends on this repo — per Django's docs.
     """
     import json as _json
 
@@ -136,29 +137,32 @@ def _run_retire(args: argparse.Namespace) -> None:
     manifest = _json.loads(manifest_path.read_text())
     replaced_to_app: dict[str, str] = manifest["replaced"]
     initials: dict[str, str] = manifest["initials"]
-    leaves: dict[str, str] = manifest["leaves"]
+    # Absent from manifests written before stub claims were recorded.
+    stubs: dict[str, str] = manifest.get("stubs", {})
+    claimed_to_stub: dict[str, str] = manifest.get("claimed_to_stub", {})
 
     apps_dirs = app_migration_dirs()
 
     # 1. Rewrite dependencies across every on-disk migration file in managed apps.
     rewritten: list[Path] = []
-    for app, app_mig_dir in apps_dirs.items():
+    for app_mig_dir in apps_dirs.values():
         if not app_mig_dir.is_dir():
             continue
         for f in app_mig_dir.glob("*.py"):
             if f.name == "__init__.py":
                 continue
-            if _rewrite_deps_in_file(f, app, replaced_to_app, initials, leaves):
+            if _rewrite_deps_in_file(f, replaced_to_app, initials, claimed_to_stub):
                 rewritten.append(f)
     sys.stderr.write(f"rewrote dependencies= in {len(rewritten)} files\n")
 
-    # 2. Empty replaces=[] on every squash file.
+    # 2. Empty replaces=[] on every squash file: the initials, plus the stubs
+    #    that claim a root node of their own.
     emptied: list[Path] = []
-    for app in sorted(initials):
+    for app, squash_name in [(a, initials[a]) for a in sorted(initials)] + [(a, stubs[a]) for a in sorted(stubs)]:
         mig_dir = apps_dirs.get(app)
         if mig_dir is None:
             continue
-        squash = mig_dir / f"{initials[app]}.py"
+        squash = mig_dir / f"{squash_name}.py"
         if squash.exists() and _empty_replaces_in_squash(squash):
             emptied.append(squash)
     sys.stderr.write(f"emptied replaces= in {len(emptied)} squash files\n")

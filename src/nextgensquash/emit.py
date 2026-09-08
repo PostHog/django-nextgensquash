@@ -475,21 +475,31 @@ class Emitter:
         return out
 
     @staticmethod
-    def _runsql_text(op: Any) -> str:
+    def _runsql_statements(op: Any) -> list[tuple[str, Any | None]]:
+        """Split RunSQL's `sql` (a string, or a list of strings / `(sql, params)`
+        pairs) into one `(statement, params)` per element, params kept.
+        """
         sql = op.sql
         if isinstance(sql, str):
-            return sql
+            return [(sql, None)]
         if isinstance(sql, (list, tuple)):
-            parts: list[str] = []
+            out: list[tuple[str, Any | None]] = []
             for s in sql:
                 if isinstance(s, str):
-                    parts.append(s)
+                    out.append((s, None))
                 elif isinstance(s, (list, tuple)) and s and isinstance(s[0], str):
-                    parts.append(s[0])
+                    out.append((s[0], s[1] if len(s) > 1 else None))
                 else:
-                    parts.append(str(s))
-            return " ".join(parts)
-        return str(sql)
+                    out.append((str(s), None))
+            return out
+        return [(str(sql), None)]
+
+    @staticmethod
+    def _runsql_text(op: Any) -> str:
+        """The op's SQL as one string, statement boundaries kept so a scan for
+        `;`-separated statements sees the same shape a list form has.
+        """
+        return ";\n".join(stmt for stmt, _ in Emitter._runsql_statements(op))
 
     def _final_state_index_names(self) -> set[str]:
         """Names already produced by final-state CreateModel — index/constraint
@@ -524,6 +534,22 @@ class Emitter:
             sql,
             flags=re.IGNORECASE,
         )
+
+    @staticmethod
+    def _idempotent_index_sql(op: Any) -> Any:
+        """`op.sql` with every CREATE INDEX made idempotent, list shape and params kept.
+
+        Flattening a list into one string would drop the params of a
+        `(sql, params)` element and merge statements Django runs separately.
+        """
+        if isinstance(op.sql, str):
+            return Emitter._ensure_idempotent_create_index(op.sql)
+        return [
+            Emitter._ensure_idempotent_create_index(stmt)
+            if params is None
+            else (Emitter._ensure_idempotent_create_index(stmt), params)
+            for stmt, params in Emitter._runsql_statements(op)
+        ]
 
     def _collect_index_runsql_ops(self) -> list[Any]:
         """Return RunSQL ops from claimed migrations that CREATE indexes the
@@ -624,7 +650,7 @@ class Emitter:
             # Wrap CREATE INDEX with IF NOT EXISTS so it's safe to run
             # after a CreateModel that may have auto-created an FK index
             # with the same name.
-            sql_safe = self._ensure_idempotent_create_index(sql_text)
+            sql_safe = self._idempotent_index_sql(op)
             # noop reverse (not op.reverse_sql, often None = irreversible):
             # see the FK-forwarding comment above.
             safe_op = dj_migrations.RunSQL(
@@ -662,6 +688,42 @@ class Emitter:
         return sorted(deps)
 
     @staticmethod
+    def _deferred_violation(op: Any, deferred: set[tuple[str, str]]) -> str | None:
+        """Describe how `op` touches one of the `(model, field)` deferred pairs, else None.
+
+        RenameModel and DeleteModel count even though they name no field: the
+        tail's AddFieldIfMissing(model_name=…) uses the model name as it stands
+        at the cutoff, and cannot find a model the young chain renamed or
+        dropped.
+        """
+        models = {mo for mo, _ in deferred}
+        kind = op.__class__.__name__
+        model_name = (getattr(op, "model_name", None) or "").lower()
+        if kind in {"AddIndex", "AddConstraint"} and model_name in models:
+            thing = getattr(op, "index", None) or getattr(op, "constraint", None)
+            fields = {f for mo, f in deferred if mo == model_name}
+            if thing is None or Emitter._index_or_constraint_references(thing, fields):
+                return f"{kind} on {model_name} references a deferred field"
+        elif kind in {"AlterField", "RemoveField", "RenameField"}:
+            fname = (getattr(op, "name", "") or "").lower()
+            if (model_name, fname) in deferred:
+                return f"{kind} {model_name}.{fname}"
+        elif kind == "RenameModel":
+            old_name = (getattr(op, "old_name", "") or "").lower()
+            if old_name in models:
+                return f"{kind} {old_name}"
+        elif kind == "DeleteModel":
+            name = (getattr(op, "name", "") or "").lower()
+            if name in models:
+                return f"{kind} {name}"
+        elif isinstance(op, dj_migrations.RunSQL):
+            cols = {f"{f}_id" for _, f in deferred}
+            hits = sorted(c for c in cols if c in Emitter._runsql_text(op))
+            if hits:
+                return f"RunSQL mentions deferred column(s) {hits}"
+        return None
+
+    @staticmethod
     def check_young_against_deferred(
         squasher: planning.Squasher, cycle_breaker: cyclebreak.CycleBreaker, loader: MigrationLoader
     ) -> None:
@@ -682,24 +744,10 @@ class Emitter:
             node = loader.graph.nodes.get(m.ref.key)
             if node is None:
                 continue
-            models = {mo for mo, _ in deferred}
-            cols = {f"{f}_id" for _, f in deferred}
             for op in node.operations:
-                kind = op.__class__.__name__
-                model_name = (getattr(op, "model_name", None) or "").lower()
-                if kind in {"AddIndex", "AddConstraint"} and model_name in models:
-                    thing = getattr(op, "index", None) or getattr(op, "constraint", None)
-                    fields = {f for mo, f in deferred if mo == model_name}
-                    if thing is None or Emitter._index_or_constraint_references(thing, fields):
-                        violations.append(f"{m.ref}: {kind} on {model_name} references a deferred field")
-                elif kind in {"AlterField", "RemoveField", "RenameField"}:
-                    fname = (getattr(op, "name", "") or "").lower()
-                    if (model_name, fname) in deferred:
-                        violations.append(f"{m.ref}: {kind} {model_name}.{fname}")
-                elif isinstance(op, dj_migrations.RunSQL):
-                    hits = sorted(c for c in cols if c in Emitter._runsql_text(op))
-                    if hits:
-                        violations.append(f"{m.ref}: RunSQL mentions deferred column(s) {hits}")
+                violation = Emitter._deferred_violation(op, deferred)
+                if violation is not None:
+                    violations.append(f"{m.ref}: {violation}")
         if violations:
             raise RuntimeError(
                 "young migrations touch deferred FK fields — bump the cutoff past them:\n  " + "\n  ".join(violations)

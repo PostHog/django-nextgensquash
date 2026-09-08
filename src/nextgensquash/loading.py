@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import re
 import subprocess
 from collections import defaultdict
@@ -105,12 +106,14 @@ class GitDates:
     COMMIT_PREFIX = "__C__"
 
     def __init__(self, repo_root: Path):
-        self.repo_root = repo_root
+        # Resolved on both sides, so the returned keys match the resolved file
+        # path a caller gets from the migration module itself.
+        self.repo_root = repo_root.resolve()
 
     def first_added(self, files: list[Path]) -> dict[Path, date]:
         if not files:
             return {}
-        rel = [str(f.relative_to(self.repo_root)) for f in files]
+        rel = [str(f.resolve().relative_to(self.repo_root)) for f in files]
         result = subprocess.run(
             [
                 "git",
@@ -140,7 +143,7 @@ class GitDates:
             stripped = line.strip()
             if not stripped or cur is None:
                 continue
-            p = self.repo_root / stripped
+            p = (self.repo_root / stripped).resolve()
             if p not in out:
                 out[p] = cur
         return out
@@ -173,7 +176,10 @@ class MigrationTree:
         for (app, name), m in loader.graph.nodes.items():
             if app not in managed:
                 continue  # skip third-party apps (auth, admin, axes, etc.)
-            file_path = repo_root / Path(*m.__module__.split(".")).with_suffix(".py")
+            # The module's own file, not the dotted path under the repo root:
+            # a src/ layout (or any sys.path root that isn't the repo root)
+            # makes the two disagree, and the git dates are keyed by real path.
+            file_path = Path(inspect.getfile(type(m))).resolve()
             out[(app, name)] = Migration(
                 ref=MigrationRef(app=app, name=name),
                 file_path=file_path,

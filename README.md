@@ -92,7 +92,7 @@ The console script `nextgensquash` is equivalent to `python -m nextgensquash`.
 
 Two flags shape the plan. `--min-young N` (default 3) keeps at least N live migrations per app after the squash, moving the newest pre-cutoff migrations to young where the date alone leaves fewer. Without it the squash becomes a dormant app's tip and claims names that in-flight branches still reference. `--no-include-prior-squashes` ignores output from earlier phases instead of folding it into the new one.
 
-The lifecycle is `emit` plus `install` on a branch, review the diff, merge. The squash then ships as a normal change: fresh databases build from it, existing ones stamp it on their next migrate. Only once it has been applied in every environment that depends on the repo do you run `retire`, which rewrites remaining dependencies to point at the squash leaves, empties `replaces=[]`, and deletes the replaced files from disk. That is Django's own advice, and doing it early strands any database that has not caught up.
+The lifecycle is `emit` plus `install` on a branch, review the diff, merge. The squash then ships as a normal change: fresh databases build from it, existing ones stamp it on their next migrate. Only once it has been applied in every environment that depends on the repo do you run `retire`, which rewrites remaining dependencies to point at the squash that replaced each folded name (the app's initial, or the stub for the root node a stub claims), empties `replaces=[]`, and deletes the replaced files from disk. That is Django's own advice, and doing it early strands any database that has not caught up.
 
 ## The planner guards
 
@@ -105,7 +105,7 @@ Five rules keep the old/young boundary in a place that produces a valid graph. E
   A young migration that only re-creates the name (`CREATE INDEX IF NOT EXISTS`, or an idempotent helper built on it) does not count: the forwarded copy is rewritten to `IF NOT EXISTS`, so the two creates are order-independent.
 - **A `run_before` never points from young into the fold.** A young migration that must run before a folded one would have to run before the squash that contains it. The `--min-young` tail rule leaves such a migration folded, and when the date cutoff itself splits the pair the tool raises and tells you to bump the cutoff past the source. Between two folded migrations of different apps, a `run_before` against the apply order is removed from the source file like any other cycle-breaking edge.
 
-There is a fifth check at emit time: a young migration that touches a deferred foreign-key field is refused outright. Young migrations get no dependency edge onto `finalize_fks`, because such an edge fails `check_consistent_history` on every existing database. That is safe only while no young operation needs the deferred columns. The fix is the same, bump the cutoff.
+There is a fifth check at emit time: a young migration that touches a deferred foreign-key field is refused outright. Young migrations get no dependency edge onto `finalize_fks`, because such an edge fails `check_consistent_history` on every existing database. That is safe only while no young operation needs the deferred columns. Renaming or deleting the model that owns one is refused too, since the tail then cannot find the model it has to add the field to. The fix is the same, bump the cutoff.
 
 ## Limitations
 
