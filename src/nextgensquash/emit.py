@@ -108,6 +108,14 @@ class Emitter:
         r'DROP\s+INDEX(?:\s+CONCURRENTLY)?(?:\s+IF\s+EXISTS)?\s+"?([a-zA-Z0-9_]+)"?',
         re.IGNORECASE,
     )
+    # `ADD CONSTRAINT c UNIQUE USING INDEX i` turns index i into the constraint,
+    # renaming it to c. The final-state CreateModel emits the constraint, so a
+    # forwarded create of i would build a second index under the old name on
+    # every database where the constraint already exists.
+    _USING_INDEX_RE = re.compile(
+        r'ADD\s+CONSTRAINT\s+"?[a-zA-Z0-9_]+"?\s+(?:UNIQUE|PRIMARY\s+KEY)\s+USING\s+INDEX\s+"?([a-zA-Z0-9_]+)"?',
+        re.IGNORECASE,
+    )
 
     # Django built-in apps that don't have squashes in the project but whose models
     # are FK-able. If any model in the current app has an FK to one of these apps,
@@ -628,6 +636,10 @@ class Emitter:
             # produce those tables and columns from final-state walk;
             # forwarding a CREATE TABLE / ALTER TABLE here would
             # collide. We only forward *pure* index work.
+            for consumed in self._USING_INDEX_RE.findall(sql_text):
+                prior = create_position.pop(consumed, None)
+                if prior is not None:
+                    kept[prior] = None  # the constraint owns that index now
             if any(kw in sql_upper for kw in ("CREATE TABLE", "ALTER TABLE", "DROP TABLE")):
                 self.dropped_runsql.append(f"{self.app}.{mig_name} [table-ddl]: {sql_text[:160]}")
                 continue

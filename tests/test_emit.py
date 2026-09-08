@@ -61,3 +61,40 @@ def test_idempotent_index_sql_keeps_list_elements_and_their_params():
         "CREATE INDEX IF NOT EXISTS a ON t (x)",
         ("CREATE INDEX IF NOT EXISTS b ON t (y) WHERE z = %s", [1]),
     ]
+
+
+def _forwarder(monkeypatch, claimed: list[tuple[str, migrations.RunSQL]]) -> Emitter:
+    # Enough of an Emitter for `_collect_index_runsql_ops`; no loader, no Django app registry.
+    emitter = object.__new__(Emitter)
+    emitter.app = "app"
+    emitter.dropped_runsql = []
+    emitter._forwarded_fk_constraint_names = set()
+    monkeypatch.setattr(emitter, "_claimed_ops", lambda: iter(claimed))
+    monkeypatch.setattr(emitter, "_final_state_index_names", lambda: set())
+    monkeypatch.setattr("nextgensquash.emit._managed_table_names", lambda: frozenset({"app_thing"}))
+    return emitter
+
+
+@pytest.mark.parametrize(
+    ("constraint_name", "forwarded"),
+    [
+        ("unique_thing", 0),  # renamed: a forwarded create would build a second index under the old name
+        ("idx_thing", 0),  # same name: the constraint's index already answers IF NOT EXISTS
+    ],
+)
+def test_using_index_constraint_cancels_the_forwarded_create(monkeypatch, constraint_name, forwarded):
+    claimed = [
+        ("0001", migrations.RunSQL('CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS "idx_thing" ON "app_thing" ("a")')),
+        (
+            "0002",
+            migrations.RunSQL(f"ALTER TABLE app_thing ADD CONSTRAINT {constraint_name} UNIQUE USING INDEX idx_thing"),
+        ),
+    ]
+    assert len(_forwarder(monkeypatch, claimed)._collect_index_runsql_ops()) == forwarded
+
+
+def test_forwarded_create_survives_without_a_consuming_constraint(monkeypatch):
+    claimed = [
+        ("0001", migrations.RunSQL('CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS "idx_thing" ON "app_thing" ("a")'))
+    ]
+    assert len(_forwarder(monkeypatch, claimed)._collect_index_runsql_ops()) == 1
