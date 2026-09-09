@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 import networkx as nx
+from django.db import connections, router
 from django.db import migrations as dj_migrations
 from django.db.migrations.loader import MigrationLoader
 from django.db.migrations.state import ProjectState
@@ -47,6 +48,11 @@ def _managed_table_names() -> frozenset[str]:
     from django.apps import apps as dj_apps
 
     return frozenset(m._meta.db_table.lower() for m in dj_apps.get_models() if m._meta.managed)
+
+
+def _migration_aliases(app_label: str) -> frozenset[str]:
+    """Database aliases the project's router lets this app migrate on."""
+    return frozenset(alias for alias in connections if router.allow_migrate(alias, app_label))
 
 
 class Emitter:
@@ -684,14 +690,24 @@ class Emitter:
         Picking initial when finalize_fks exists would race: the forwarded
         index could reference a deferred-FK column that finalize_fks hasn't
         added yet.
+
+        Apps that a router keeps on a different database are skipped. An index
+        cannot reach across databases, so the dep buys nothing, and it breaks
+        Django's consistency check on every database that records the routed
+        app somewhere else.
         """
         deps: set[tuple[str, str]] = {(self.app, prior_squash)}
         # Emit skips claimed apps with no models left in the final state (all
         # moved away, e.g. llm_analytics) — no squash file exists for them, so
         # no dep may point at one.
         apps_with_models = {a for (a, _) in self.state.models}
+        own_aliases = _migration_aliases(self.app)
         for app in {m.ref.app for m in self.squasher.old.values()}:
             if app == self.app or app not in apps_with_models:
+                continue
+            # The dep must hold on every alias this app migrates on, or the
+            # addons file is recorded on an alias where its parent never is.
+            if not own_aliases <= _migration_aliases(app):
                 continue
             # Match the post-emit naming convention; see INITIAL_NAME / FINALIZE_NAME.
             has_finalize = bool(self.cycle_breaker.deferred_for_app(app))

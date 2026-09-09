@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from datetime import date
+from types import SimpleNamespace
+
 import pytest
 from django.db import migrations, models
 
@@ -98,3 +101,28 @@ def test_forwarded_create_survives_without_a_consuming_constraint(monkeypatch):
         ("0001", migrations.RunSQL('CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS "idx_thing" ON "app_thing" ("a")'))
     ]
     assert len(_forwarder(monkeypatch, claimed)._collect_index_runsql_ops()) == 1
+
+
+def test_schema_addons_deps_skips_apps_on_another_database(monkeypatch):
+    alias_of = {"app": "default", "sibling": "default", "routed": "other_db"}
+    monkeypatch.setattr("nextgensquash.emit.connections", ["default", "other_db"])
+    monkeypatch.setattr(
+        "nextgensquash.emit.router",
+        SimpleNamespace(allow_migrate=lambda alias, app_label, **hints: alias_of[app_label] == alias),
+    )
+
+    # Enough of an Emitter for `_schema_addons_deps`; no state, no planner, no cycle breaker.
+    emitter = object.__new__(Emitter)
+    emitter.app = "app"
+    emitter.state = SimpleNamespace(models={(app, "thing"): None for app in alias_of})
+    emitter.squasher = SimpleNamespace(
+        cutoff=date(2026, 1, 1),
+        max_number=lambda app: 42,
+        old={app: SimpleNamespace(ref=SimpleNamespace(app=app)) for app in alias_of},
+    )
+    emitter.cycle_breaker = SimpleNamespace(deferred_for_app=lambda app: set())
+
+    assert emitter._schema_addons_deps("0001_x") == [
+        ("app", "0001_x"),
+        ("sibling", "0001_squash_2026_01_01_initial"),
+    ]
