@@ -705,7 +705,9 @@ class Emitter:
         for app in {m.ref.app for m in self.squasher.old.values()}:
             if app == self.app or app not in apps_with_models:
                 continue
-            if not (_migration_aliases(app) & own_aliases):
+            # The dep must hold on every alias this app migrates on, or the
+            # addons file is recorded on an alias where its parent never is.
+            if not own_aliases <= _migration_aliases(app):
                 continue
             # Match the post-emit naming convention; see INITIAL_NAME / FINALIZE_NAME.
             has_finalize = bool(self.cycle_breaker.deferred_for_app(app))
