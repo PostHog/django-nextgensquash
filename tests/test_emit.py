@@ -129,6 +129,20 @@ def test_schema_addons_deps_skips_apps_on_another_database(monkeypatch):
     ]
 
 
+def test_replaced_roots_are_the_replaced_migrations_without_a_replaced_dependency(make_migration):
+    root = make_migration("app", "0001_initial")
+    second = make_migration("app", "0002_second", dependencies=[root.ref])
+    orphan = make_migration("app", "0003_orphan", dependencies=[make_migration("other", "0001_initial").ref])
+    elsewhere = make_migration("other", "0009_thing")
+    emitter = object.__new__(Emitter)
+    emitter.app = "app"
+    emitter.squasher = SimpleNamespace(old={m.ref.key: m for m in (root, second, orphan, elsewhere)})
+
+    replaces = [m.ref.key for m in (root, second, orphan, elsewhere)]
+
+    assert emitter.replaced_roots(replaces) == [("app", "0001_initial"), ("app", "0003_orphan")]
+
+
 @pytest.mark.parametrize(
     ("replaces", "writes_run_before"),
     [

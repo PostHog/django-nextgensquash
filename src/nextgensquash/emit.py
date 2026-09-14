@@ -965,6 +965,24 @@ class Emitter:
             leaf.dependencies = sorted({*leaf.dependencies, (self.app, max(young_names))})
         return files
 
+    def replaced_roots(self, replaces: list[tuple[str, str]]) -> list[tuple[str, str]]:
+        """Replaced migrations of this app that depend on no other replaced migration.
+
+        `install` makes each root depend on the stub. On a database that applied
+        only part of the replaced range, the loader drops the initial and uses the
+        replaced files, so the initial no longer connects the stub to the app. The
+        stub then becomes a second leaf, and `migrate` refuses to run.
+        """
+        replaced = set(replaces)
+        roots = []
+        for key in sorted(replaced):
+            migration = self.squasher.old.get(key)
+            if migration is None or migration.ref.app != self.app:
+                continue
+            if not any(dep.key in replaced for dep in migration.dependencies):
+                roots.append(key)
+        return roots
+
 
 class FileWriter:
     """Serializes SquashFile to a .py file via Django's MigrationWriter."""

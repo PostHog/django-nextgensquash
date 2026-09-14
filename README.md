@@ -96,6 +96,8 @@ The lifecycle is `emit` plus `install` on a branch, review the diff, merge. The 
 
 The emitter never writes `run_before` into a squash that still has `replaces`. On a database that applied only part of the replaced range, Django falls back to the original files and moves every child of the squash onto the last replaced migration. A `run_before` target is such a child, so an already-applied target would depend on an unapplied migration, and `check_consistent_history` refuses to migrate. While the replaced files exist they carry the entries, and the loader moves them onto the squash when it substitutes. The manifest records them for `retire`.
 
+The same fallback drops the initial's edge to the stub, and the initial is the stub's only child in its app. So `install` also makes every replaced root migration (one that depends on no other replaced migration) depend on the stub, from `STUB_ROOT_EDGES.txt`. Without that edge the stub becomes a second leaf of the app, and `migrate` stops with "Conflicting migrations detected".
+
 ## The planner guards
 
 Five rules keep the old/young boundary in a place that produces a valid graph. Each one either pins a migration folded or forces it young; when the two conflict the tool raises rather than emitting something that fails minutes into a fresh migrate.
