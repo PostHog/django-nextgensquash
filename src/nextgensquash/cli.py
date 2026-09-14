@@ -130,7 +130,7 @@ def _run_emit(args: argparse.Namespace, config: Config) -> None:
             for claimed_app, claimed_name in stub.replaces:
                 retire_manifest["replaced"][f"{claimed_app}/{claimed_name}"] = claimed_app
                 retire_manifest["claimed_to_stub"][f"{claimed_app}/{claimed_name}"] = stub.name
-            for root_app, root_name in emitter.replaced_roots(initial.replaces):
+            for root_app, root_name in emitter.replaced_roots(initial.replaces, stub.replaces):
                 stub_root_edges.append(f"{root_app}/{root_name} -> {app}/{stub.name}")
     # Save cycle-break edge-removal list as a sidecar for `install` to act on.
     if cycle_edges or run_before_edges:
