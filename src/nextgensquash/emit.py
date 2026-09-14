@@ -886,7 +886,28 @@ class Emitter:
                     atomic=False,  # CREATE INDEX CONCURRENTLY can't run inside a transaction
                 )
             )
-        return self._single_leaf(files)
+        return self._single_leaf(self._connect_stub_to_tail(files))
+
+    def _connect_stub_to_tail(self, files: list[SquashFile]) -> list[SquashFile]:
+        """Make the first tail after the initial depend on the stub too.
+
+        On a database that applied only part of the initial's replaced range, the
+        loader drops the initial and uses the replaced files. The initial was the
+        stub's only child in the app, so the stub becomes a second leaf and
+        `migrate` stops with "Conflicting migrations detected". The tail survives
+        that fallback. It runs after the whole range, so the edge never makes an
+        already-applied migration depend on the stub.
+        """
+        if files[0].name != self.STUB_NAME:
+            return files
+        tails = [sq for sq in files if sq.name in (self.FINALIZE_NAME, self.SCHEMA_ADDONS_NAME)]
+        if not tails:
+            raise RuntimeError(
+                f"{self.app} emits a stub but no finalize_fks or schema_addons tail, so a partially "
+                f"migrated database would have the stub as a second leaf"
+            )
+        tails[0].dependencies = sorted({*tails[0].dependencies, (self.app, self.STUB_NAME)})
+        return files
 
     def _build_finalize(
         self,
@@ -995,8 +1016,16 @@ class FileWriter:
         if not sq.atomic:
             # MigrationWriter doesn't emit `atomic` even when False — inject it.
             text = text.replace("    initial = True\n", "    initial = True\n    atomic = False\n", 1)
-        if sq.run_before:
-            # MigrationWriter doesn't serialize run_before either.
+        if sq.run_before and not sq.replaces:
+            # MigrationWriter doesn't serialize run_before either. A squash
+            # that still replaces migrations must not declare it: the replaced
+            # files carry the same entries, and the loader moves them onto the
+            # squash when it substitutes. On a database that applied only part
+            # of the replaced range, the loader drops the squash instead and
+            # moves the squash's children onto the last replaced migration, so
+            # the already-applied run_before target depends on an unapplied
+            # migration and check_consistent_history refuses to migrate.
+            # `retire` writes the entries back when it deletes the replaced files.
             entries = "".join(f'        ("{a}", "{n}"),\n' for a, n in sq.run_before)
             text = text.replace(
                 "    initial = True\n",
