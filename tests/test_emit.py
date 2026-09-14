@@ -129,26 +129,18 @@ def test_schema_addons_deps_skips_apps_on_another_database(monkeypatch):
     ]
 
 
-def test_replaced_roots_are_the_replaced_migrations_without_a_replaced_or_claimed_dependency():
-    disk = {
-        ("app", "0001_initial"): [("auth", "0011_update_proxy_permissions")],
-        ("app", "0002_second"): [("app", "0001_initial")],
-        ("app", "0003_orphan"): [("other", "0001_initial")],
-        ("app", "0004_after_prior_squash"): [("app", "0001_prior_squash")],
-        ("other", "0009_thing"): [],
-    }
+def test_replaced_roots_are_the_replaced_migrations_without_a_replaced_dependency(make_migration):
+    root = make_migration("app", "0001_initial")
+    second = make_migration("app", "0002_second", dependencies=[root.ref])
+    orphan = make_migration("app", "0003_orphan", dependencies=[make_migration("other", "0001_initial").ref])
+    elsewhere = make_migration("other", "0009_thing")
     emitter = object.__new__(Emitter)
     emitter.app = "app"
-    emitter.loader = SimpleNamespace(
-        disk_migrations={key: SimpleNamespace(dependencies=deps) for key, deps in disk.items()}
-    )
+    emitter.squasher = SimpleNamespace(old={m.ref.key: m for m in (root, second, orphan, elsewhere)})
 
-    replaces = [*disk, ("app", "0005_not_on_disk")]
+    replaces = [m.ref.key for m in (root, second, orphan, elsewhere)]
 
-    assert emitter.replaced_roots(replaces, [("app", "0001_prior_squash")]) == [
-        ("app", "0001_initial"),
-        ("app", "0003_orphan"),
-    ]
+    assert emitter.replaced_roots(replaces) == [("app", "0001_initial"), ("app", "0003_orphan")]
 
 
 @pytest.mark.parametrize(

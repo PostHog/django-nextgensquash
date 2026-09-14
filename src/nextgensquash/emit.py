@@ -965,28 +965,21 @@ class Emitter:
             leaf.dependencies = sorted({*leaf.dependencies, (self.app, max(young_names))})
         return files
 
-    def replaced_roots(
-        self, replaces: list[tuple[str, str]], stub_claims: list[tuple[str, str]]
-    ) -> list[tuple[str, str]]:
-        """Replaced migrations of this app that depend on no other replaced or stub-claimed migration.
+    def replaced_roots(self, replaces: list[tuple[str, str]]) -> list[tuple[str, str]]:
+        """Replaced migrations of this app that depend on no other replaced migration.
 
         `install` makes each root depend on the stub. On a database that applied
         only part of the replaced range, the loader drops the initial and uses the
         replaced files, so the initial no longer connects the stub to the app. The
         stub then becomes a second leaf, and `migrate` refuses to run.
-
-        Dependencies come from the files on disk, because `install` empties the
-        `replaces` of prior squashes and their members become live nodes. A member
-        that depends on a stub claim already follows the stub.
         """
         replaced = set(replaces)
-        connected = replaced | set(stub_claims)
         roots = []
         for key in sorted(replaced):
-            migration = self.loader.disk_migrations.get(key)
-            if key[0] != self.app or migration is None:
+            migration = self.squasher.old.get(key)
+            if migration is None or migration.ref.app != self.app:
                 continue
-            if not any(tuple(dep) in connected for dep in migration.dependencies):
+            if not any(dep.key in replaced for dep in migration.dependencies):
                 roots.append(key)
         return roots
 
