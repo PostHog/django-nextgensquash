@@ -129,6 +129,40 @@ def test_schema_addons_deps_skips_apps_on_another_database(monkeypatch):
     ]
 
 
+def _tail_emitter() -> Emitter:
+    emitter = object.__new__(Emitter)
+    emitter.app = "app"
+    emitter.squasher = SimpleNamespace(cutoff=date(2026, 1, 1), max_number=lambda app: 42)
+    return emitter
+
+
+def _squash(name: str, dependencies: list[tuple[str, str]] | None = None) -> SquashFile:
+    return SquashFile(app="app", name=name, operations=[], dependencies=dependencies or [], replaces=[])
+
+
+def test_connect_stub_to_tail_adds_the_stub_to_the_first_tail_only():
+    emitter = _tail_emitter()
+    stub = ("app", emitter.STUB_NAME)
+    files = [
+        _squash(emitter.STUB_NAME),
+        _squash(emitter.INITIAL_NAME, [stub]),
+        _squash(emitter.FINALIZE_NAME, [("app", emitter.INITIAL_NAME)]),
+        _squash(emitter.SCHEMA_ADDONS_NAME, [("app", emitter.FINALIZE_NAME)]),
+    ]
+
+    emitter._connect_stub_to_tail(files)
+
+    assert stub in files[2].dependencies
+    assert stub not in files[3].dependencies
+
+
+def test_connect_stub_to_tail_refuses_a_stub_without_a_tail():
+    emitter = _tail_emitter()
+
+    with pytest.raises(RuntimeError, match="second leaf"):
+        emitter._connect_stub_to_tail([_squash(emitter.STUB_NAME), _squash(emitter.INITIAL_NAME)])
+
+
 @pytest.mark.parametrize(
     ("replaces", "writes_run_before"),
     [
