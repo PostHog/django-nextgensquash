@@ -99,19 +99,6 @@ def test_rewrite_points_a_stub_claimed_dep_at_the_stub(tmp_path):
     assert '("core", "0001_squash_2026_01_01_initial"),' in result
 
 
-def test_transform_dependencies_appends_a_missing_entry_once(tmp_path):
-    path = tmp_path / "0001_initial.py"
-    path.write_text(MIGRATION_SOURCE)
-
-    stub = ("core", "0000_squash_stub")
-    assert retire.transform_dependencies(path, lambda dep: dep, append=(stub,)) is True
-    assert retire.transform_dependencies(path, lambda dep: dep, append=(stub,)) is False
-
-    result = path.read_text()
-    assert result.count('("core", "0000_squash_stub"),') == 1
-    assert '("other", "0007_thing"),' in result
-
-
 def test_transform_dependencies_can_target_run_before(tmp_path):
     path = tmp_path / "0002_thing.py"
     path.write_text(MIGRATION_SOURCE)

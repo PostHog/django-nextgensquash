@@ -86,7 +86,6 @@ def _run_emit(args: argparse.Namespace, config: Config) -> None:
         "claimed_to_stub": {},  # "app/name" -> stub name, for the stub's own claims
         "run_before": {},  # app -> run_before the initial takes over once the replaced files are gone
     }
-    stub_root_edges: list[str] = []
     for app in apps:
         emitter = emit.Emitter(state, squasher, app, cycle_breaker, config, loader)
         squashes = emitter.build()
@@ -130,8 +129,6 @@ def _run_emit(args: argparse.Namespace, config: Config) -> None:
             for claimed_app, claimed_name in stub.replaces:
                 retire_manifest["replaced"][f"{claimed_app}/{claimed_name}"] = claimed_app
                 retire_manifest["claimed_to_stub"][f"{claimed_app}/{claimed_name}"] = stub.name
-            for root_app, root_name in emitter.replaced_roots(initial.replaces):
-                stub_root_edges.append(f"{root_app}/{root_name} -> {app}/{stub.name}")
     # Save cycle-break edge-removal list as a sidecar for `install` to act on.
     if cycle_edges or run_before_edges:
         edges_file = args.output_dir / "CYCLE_EDGE_REMOVALS.txt"
@@ -139,11 +136,6 @@ def _run_emit(args: argparse.Namespace, config: Config) -> None:
         lines += [f"{fa}/{fn} -> {ta}/{tn} run_before" for (fa, fn, ta, tn) in run_before_edges]
         edges_file.write_text("\n".join(lines) + "\n")
         sys.stderr.write(f"\nwrote cycle-break edge-removal list to {edges_file}\n")
-
-    if stub_root_edges:
-        stub_edges_file = args.output_dir / "STUB_ROOT_EDGES.txt"
-        stub_edges_file.write_text("\n".join(stub_root_edges) + "\n")
-        sys.stderr.write(f"wrote stub root edge additions to {stub_edges_file}\n")
 
     if dropped_runsql:
         dropped_path = args.output_dir / "DROPPED_RUNSQL.txt"

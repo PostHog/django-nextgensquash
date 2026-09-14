@@ -69,22 +69,6 @@ def _run_install(args: argparse.Namespace) -> None:
         for edited in _strip_cycle_edges_from_migrations(app_edges, target_dir):
             if edited not in deleted:
                 deleted.append(edited)
-    # Stub root edges: each replaced root of an app with a stub depends on the stub.
-    stub_edges_path = output_dir / "STUB_ROOT_EDGES.txt"
-    if stub_edges_path.exists():
-        for line in stub_edges_path.read_text().splitlines():
-            if " -> " not in line:
-                continue
-            lhs, rhs = line.strip().split(" -> ", 1)
-            root_app, root_name = lhs.split("/", 1)
-            stub_app, stub_name = rhs.split("/", 1)
-            root_dir = apps_dirs.get(root_app)
-            root_path = root_dir / f"{root_name}.py" if root_dir else None
-            if root_path is None or not root_path.exists():
-                sys.stderr.write(f"  warning: no file for stub root {root_app}.{root_name}\n")
-                continue
-            if retire.transform_dependencies(root_path, lambda dep: dep, append=((stub_app, stub_name),)):
-                deleted.append(root_path)
     leaves = _compute_all_app_graph_leaves([app for app, _, _ in apps_processed])
     for app, target_dir, squash_paths in apps_processed:
         leaf = leaves.get(app)

@@ -14,18 +14,15 @@ from nextgensquash.config import app_migration_dirs
 
 
 def transform_dependencies(
-    path: Path,
-    transform: Callable[[tuple[str, str]], tuple[str, str] | None],
-    attr: str = "dependencies",
-    append: tuple[tuple[str, str], ...] = (),
+    path: Path, transform: Callable[[tuple[str, str]], tuple[str, str] | None], attr: str = "dependencies"
 ) -> bool:
     """Rewrite `Migration.<attr> = [...]` (dependencies or run_before) in `path` through `transform`.
 
     `transform` maps each `(app, name)` tuple to a replacement tuple, or None
-    to drop the entry. `append` adds entries the list does not hold yet. AST-based,
-    so single-line and multi-line list styles both work. Untouched entries keep
-    their original source text (sentinel strings and unusual expressions
-    included); duplicate results collapse. Returns True when the file changed.
+    to drop the entry. AST-based, so single-line and multi-line list styles
+    both work. Untouched entries keep their original source text (sentinel
+    strings and unusual expressions included); duplicate results collapse.
+    Returns True when the file changed.
     """
     src = path.read_text()
     try:
@@ -69,13 +66,6 @@ def transform_dependencies(
         if text and key not in seen:
             seen.add(key)
             entries.append(text)
-
-    for dep in append:
-        key = f"{dep[0]}/{dep[1]}"
-        if key not in seen:
-            seen.add(key)
-            entries.append(f'("{dep[0]}", "{dep[1]}")')
-            changed = True
 
     if not changed:
         return False
