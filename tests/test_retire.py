@@ -109,3 +109,29 @@ def test_transform_dependencies_can_target_run_before(tmp_path):
     result = path.read_text()
     assert "0009_later" not in result
     assert '("other", "0007_thing"),' in result
+
+
+SQUASH_SOURCE = """from django.db import migrations
+
+
+class Migration(migrations.Migration):
+    replaces = []
+
+    initial = True
+
+    dependencies = []
+
+    operations = []
+"""
+
+
+def test_add_run_before_moves_the_entries_onto_the_squash_once(tmp_path):
+    path = tmp_path / "0001_squash_2026_01_01_initial.py"
+    path.write_text(SQUASH_SOURCE)
+
+    assert retire._add_run_before(path, [("oauth2_provider", "0001_initial")]) is True
+    assert retire._add_run_before(path, [("oauth2_provider", "0001_initial")]) is False
+
+    result = path.read_text()
+    assert result.count("run_before") == 1
+    assert '    run_before = [\n        ("oauth2_provider", "0001_initial"),\n    ]\n' in result

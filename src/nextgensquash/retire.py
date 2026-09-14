@@ -118,6 +118,19 @@ def _empty_replaces_in_squash(path: Path) -> bool:
     return True
 
 
+def _add_run_before(path: Path, entries: list[tuple[str, str]]) -> bool:
+    """Insert `run_before = [...]` after `initial = True` in a squash file that declares none."""
+    src = path.read_text()
+    if not entries or re.search(r"^\s+run_before\s*=", src, flags=re.M):
+        return False
+    lines = "".join(f'        ("{app}", "{name}"),\n' for app, name in entries)
+    new = src.replace("    initial = True\n", f"    initial = True\n\n    run_before = [\n{lines}    ]\n", 1)
+    if new == src:
+        return False
+    path.write_text(new)
+    return True
+
+
 def _run_retire(args: argparse.Namespace) -> None:
     """Canonical Django retirement of the squashes already installed via `install`.
 
@@ -140,6 +153,7 @@ def _run_retire(args: argparse.Namespace) -> None:
     # Absent from manifests written before stub claims were recorded.
     stubs: dict[str, str] = manifest.get("stubs", {})
     claimed_to_stub: dict[str, str] = manifest.get("claimed_to_stub", {})
+    run_before: dict[str, list[list[str]]] = manifest.get("run_before", {})
 
     apps_dirs = app_migration_dirs()
 
@@ -167,7 +181,17 @@ def _run_retire(args: argparse.Namespace) -> None:
             emptied.append(squash)
     sys.stderr.write(f"emptied replaces= in {len(emptied)} squash files\n")
 
-    # 3. Delete the replaced files on disk.
+    # 3. Move run_before onto the initials. Until now the replaced files carried
+    #    it, and step 4 deletes them.
+    for app in sorted(run_before):
+        mig_dir = apps_dirs.get(app)
+        if mig_dir is None:
+            continue
+        squash = mig_dir / f"{initials[app]}.py"
+        if squash.exists():
+            _add_run_before(squash, [(a, n) for a, n in run_before[app]])
+
+    # 4. Delete the replaced files on disk.
     deleted: list[Path] = []
     for replaced_key in replaced_to_app:
         replaced_app, replaced_name = replaced_key.split("/", 1)

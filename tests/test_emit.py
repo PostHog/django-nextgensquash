@@ -4,9 +4,10 @@ from datetime import date
 from types import SimpleNamespace
 
 import pytest
+from django.conf import settings
 from django.db import migrations, models
 
-from nextgensquash.emit import Emitter
+from nextgensquash.emit import Emitter, FileWriter, SquashFile
 
 DEFERRED = {("thing", "team")}
 
@@ -126,3 +127,27 @@ def test_schema_addons_deps_skips_apps_on_another_database(monkeypatch):
         ("app", "0001_x"),
         ("sibling", "0001_squash_2026_01_01_initial"),
     ]
+
+
+@pytest.mark.parametrize(
+    ("replaces", "writes_run_before"),
+    [
+        ([("app", "0001_initial")], False),
+        ([], True),
+    ],
+)
+def test_run_before_is_written_only_once_the_squash_replaces_nothing(tmp_path, replaces, writes_run_before):
+    if not settings.configured:
+        settings.configure()
+    squash = SquashFile(
+        app="app",
+        name="0001_squash_2026_01_01_initial",
+        operations=[],
+        dependencies=[],
+        replaces=replaces,
+        run_before=[("oauth2_provider", "0001_initial")],
+    )
+
+    text = FileWriter(tmp_path).write(squash).read_text()
+
+    assert ('("oauth2_provider", "0001_initial")' in text) is writes_run_before

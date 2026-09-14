@@ -995,8 +995,16 @@ class FileWriter:
         if not sq.atomic:
             # MigrationWriter doesn't emit `atomic` even when False — inject it.
             text = text.replace("    initial = True\n", "    initial = True\n    atomic = False\n", 1)
-        if sq.run_before:
-            # MigrationWriter doesn't serialize run_before either.
+        if sq.run_before and not sq.replaces:
+            # MigrationWriter doesn't serialize run_before either. A squash
+            # that still replaces migrations must not declare it: the replaced
+            # files carry the same entries, and the loader moves them onto the
+            # squash when it substitutes. On a database that applied only part
+            # of the replaced range, the loader drops the squash instead and
+            # moves the squash's children onto the last replaced migration, so
+            # the already-applied run_before target depends on an unapplied
+            # migration and check_consistent_history refuses to migrate.
+            # `retire` writes the entries back when it deletes the replaced files.
             entries = "".join(f'        ("{a}", "{n}"),\n' for a, n in sq.run_before)
             text = text.replace(
                 "    initial = True\n",

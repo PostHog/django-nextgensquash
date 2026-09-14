@@ -84,6 +84,7 @@ def _run_emit(args: argparse.Namespace, config: Config) -> None:
         "stubs": {},  # app -> stub name, for the apps that emit one
         "replaced": {},  # "app/name" -> app  (every name claimed by a squash)
         "claimed_to_stub": {},  # "app/name" -> stub name, for the stub's own claims
+        "run_before": {},  # app -> run_before the initial takes over once the replaced files are gone
     }
     for app in apps:
         emitter = emit.Emitter(state, squasher, app, cycle_breaker, config, loader)
@@ -118,6 +119,8 @@ def _run_emit(args: argparse.Namespace, config: Config) -> None:
             retire_manifest["leaves"][app] = emitter.INITIAL_NAME
         for replaced_app, replaced_name in initial.replaces:
             retire_manifest["replaced"][f"{replaced_app}/{replaced_name}"] = replaced_app
+        if initial.run_before:
+            retire_manifest["run_before"][app] = initial.run_before
         stub = next((sq for sq in squashes if sq.name == emitter.STUB_NAME), None)
         if stub is not None:
             retire_manifest["stubs"][app] = stub.name
