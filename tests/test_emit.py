@@ -303,3 +303,38 @@ def test_index_clause_on_a_raw_dropped_column_is_left_out(monkeypatch, sql):
         ("0002", migrations.RunSQL("ALTER TABLE app_thing DROP COLUMN legacy_id")),
     ]
     assert _forwarder(monkeypatch, claimed)._collect_index_runsql_ops() == []
+
+
+@pytest.mark.parametrize(
+    ("sql", "dropped_by", "forwarded"),
+    [
+        ('CREATE INDEX "idx_incl" ON "app_thing" ("a") INCLUDE ("legacy")', "remove_field", 0),
+        ('CREATE INDEX "idx_lit" ON "app_thing" ("a") WHERE b = \'legacy_id\'', "raw_sql", 1),
+    ],
+)
+def test_dropped_column_check_follows_remove_field_and_skips_literals(monkeypatch, sql, dropped_by, forwarded):
+    drop = (
+        migrations.RemoveField(model_name="thing", name="legacy")
+        if dropped_by == "remove_field"
+        else migrations.RunSQL("ALTER TABLE app_thing DROP COLUMN legacy_id")
+    )
+    monkeypatch.setattr("nextgensquash.emit._model_db_table", lambda app_label, model_name: "app_thing")
+
+    assert (
+        len(_forwarder(monkeypatch, [("0001", migrations.RunSQL(sql)), ("0002", drop)])._collect_index_runsql_ops())
+        == forwarded
+    )
+
+
+def test_run_before_of_a_file_behind_a_prior_squash_is_carried(make_migration):
+    behind = make_migration("app", "0001_original")
+    behind.run_before.append(loading.MigrationRef("oauth2_provider", "0001_initial"))
+    prior = make_migration("app", "0001_squash_2026_01_01_initial", replaces=[behind.ref])
+    emitter = object.__new__(Emitter)
+    emitter.app = "app"
+    emitter.squasher = SimpleNamespace(
+        old_with_hidden_members=lambda: [prior, behind],
+        is_folded=lambda key: key in {prior.ref.key, behind.ref.key},
+    )
+
+    assert emitter._carried_run_before() == [("oauth2_provider", "0001_initial")]

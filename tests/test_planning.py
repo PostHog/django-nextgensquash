@@ -174,3 +174,14 @@ def test_run_before_onto_a_file_behind_a_young_squash_stays(make_migration):
     breaker.apply_order = ["b", "a"]
 
     assert breaker.run_before_break_edges(squasher) == []
+
+
+def test_young_run_before_onto_a_file_behind_a_prior_squash_is_refused(make_migration):
+    behind = make_migration("core", "0001_original")
+    prior = make_migration("core", "0001_squash_2025_01_01_initial", commit_date=OLD_DATE, replaces=[behind.ref])
+    young = make_migration("other", "0005_young", commit_date=YOUNG_DATE)
+    young.run_before.append(behind.ref)
+    tree = loading.MigrationTree({m.ref.key: m for m in (prior, young)}, Config(), hidden={behind.ref.key: behind})
+
+    with pytest.raises(RuntimeError, match="must run before folded"):
+        planning.Squasher(tree, CUTOFF, min_young=0)

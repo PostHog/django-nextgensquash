@@ -62,6 +62,16 @@ def _managed_table_columns() -> dict[str, frozenset[str]]:
     }
 
 
+def _model_db_table(app_label: str, model_name: str) -> str | None:
+    """Lowercase table name of a model in the final state, or None when it is gone."""
+    from django.apps import apps as dj_apps
+
+    try:
+        return dj_apps.get_model(app_label, model_name)._meta.db_table.lower()
+    except LookupError:
+        return None
+
+
 def _migration_aliases(app_label: str) -> frozenset[str]:
     """Database aliases the project's router lets this app migrate on."""
     return frozenset(alias for alias in connections if router.allow_migrate(alias, app_label))
@@ -366,11 +376,11 @@ class Emitter:
         MigrationWriter doesn't serialize run_before, so FileWriter injects it.
         """
         out: set[tuple[str, str]] = set()
-        for m in self.squasher.old.values():
+        for m in self.squasher.old_with_hidden_members():
             if m.ref.app != self.app:
                 continue
             for rb in m.run_before:
-                if rb.key not in self.squasher.old:
+                if not self.squasher.is_folded(rb.key):
                     out.add(rb.key)
         return sorted(out)
 
@@ -522,13 +532,8 @@ class Emitter:
 
     def _model_has_column(self, model_name: str, column: str) -> bool:
         """Whether this app's model still has `column` in the final state."""
-        from django.apps import apps as dj_apps
-
-        try:
-            model = dj_apps.get_model(self.app, model_name)
-        except LookupError:
-            return False
-        return column in _managed_table_columns().get(model._meta.db_table.lower(), frozenset())
+        table = _model_db_table(self.app, model_name)
+        return table is not None and column in _managed_table_columns().get(table, frozenset())
 
     @staticmethod
     def _runsql_statements(op: Any) -> list[tuple[str, Any | None]]:
@@ -598,26 +603,35 @@ class Emitter:
     def _index_is_dead(sql: str, after: int, columns: frozenset[str], dropped: set[str]) -> bool:
         """Whether a CREATE INDEX needs a column the final state lacks. Bare key
         columns are checked against the table's columns. Everything after the
-        table (expressions, INCLUDE, WHERE) is checked only against columns a
-        claimed raw DROP COLUMN removed, since its other words can be functions,
+        table (expressions, INCLUDE, WHERE) is checked only against columns that
+        claimed migrations removed, since its other words can be functions,
         casts, operator classes, or keywords."""
         for element in Emitter._index_elements(sql, after):
             if "(" not in element and element.split()[0].strip('"') not in columns:
                 return True
-        return any(word in dropped for word in re.findall(r'"?([A-Za-z_][A-Za-z0-9_]*)"?', sql[after:]))
+        # String literals are values, not column references.
+        tail = re.sub(r"'(?:[^']|'')*'", "''", sql[after:])
+        return any(word in dropped for word in re.findall(r'"?([A-Za-z_][A-Za-z0-9_]*)"?', tail))
 
-    def _raw_dropped_columns(self) -> dict[str, set[str]]:
-        """Columns that claimed raw SQL drops, by lowercase table name."""
+    def _dropped_columns(self) -> dict[str, set[str]]:
+        """Columns that claimed migrations remove, by lowercase table name: raw
+        DROP COLUMN statements, and RemoveField ops (a foreign key's column is
+        the field name plus `_id`, so both names count)."""
         out: dict[str, set[str]] = {}
         for _mig_name, op in self._claimed_ops():
-            if not isinstance(op, dj_migrations.RunSQL):
-                continue
-            for stmt in self._runsql_text(op).split(";"):
-                table = re.search(r"ALTER\s+TABLE\s+(?:IF\s+EXISTS\s+)?(?:ONLY\s+)?\"?(\w+)\"?", stmt, re.IGNORECASE)
-                if table is None:
-                    continue
-                names = re.findall(r"DROP\s+COLUMN\s+(?:IF\s+EXISTS\s+)?\"?(\w+)\"?", stmt, re.IGNORECASE)
-                out.setdefault(table.group(1).lower(), set()).update(names)
+            if isinstance(op, dj_migrations.RemoveField):
+                table = _model_db_table(self.app, op.model_name)
+                if table is not None:
+                    out.setdefault(table, set()).update({op.name, f"{op.name}_id"})
+            elif isinstance(op, dj_migrations.RunSQL):
+                for stmt in self._runsql_text(op).split(";"):
+                    table_match = re.search(
+                        r"ALTER\s+TABLE\s+(?:IF\s+EXISTS\s+)?(?:ONLY\s+)?\"?(\w+)\"?", stmt, re.IGNORECASE
+                    )
+                    if table_match is None:
+                        continue
+                    names = re.findall(r"DROP\s+COLUMN\s+(?:IF\s+EXISTS\s+)?\"?(\w+)\"?", stmt, re.IGNORECASE)
+                    out.setdefault(table_match.group(1).lower(), set()).update(names)
         return out
 
     @staticmethod
@@ -675,7 +689,7 @@ class Emitter:
         """
         meta_index_names = self._final_state_index_names()
         managed_tables = _managed_table_names()
-        raw_dropped = self._raw_dropped_columns()
+        dropped_columns = self._dropped_columns()
 
         kept: list[Any | None] = []
         create_position: dict[str, int] = {}
@@ -776,7 +790,7 @@ class Emitter:
             # A later raw DROP COLUMN leaves the final state without the column,
             # and the forwarded create would fail on a fresh database.
             table_columns = _managed_table_columns().get(table_name, frozenset())
-            dropped = raw_dropped.get(table_name, set()) - table_columns
+            dropped = dropped_columns.get(table_name, set()) - table_columns
             if self._index_is_dead(sql_text, create_match.end(), table_columns, dropped):
                 self.dropped_runsql.append(f"{self.app}.{mig_name} [dead-column]: {sql_text[:160]}")
                 continue
