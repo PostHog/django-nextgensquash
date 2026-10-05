@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 from datetime import date
+from types import SimpleNamespace
 
 import pytest
 
 from nextgensquash import loading, planning
 from nextgensquash.config import Config
+from nextgensquash.cyclebreak import CycleBreaker
 
 CUTOFF = date(2026, 1, 1)
 OLD_DATE = date(2025, 6, 1)
@@ -141,3 +143,45 @@ def test_max_number_ignores_unnumbered_names(make_migration):
     assert squasher.max_number("core") == 1342
     assert squasher.max_number("other") == 7
     assert squasher.max_number("missing") == 0
+
+
+def test_cycle_break_reaches_files_behind_a_prior_squash(make_migration):
+    # The prior squash is deleted on install, so the file it replaces carries the back edge.
+    behind = make_migration("a", "0001_original", dependencies=[loading.MigrationRef("b", "0005_x")])
+    prior = make_migration("a", "0001_squash_2026_01_01_initial", replaces=[behind.ref])
+    squasher = SimpleNamespace(
+        old={prior.ref.key: prior},
+        tree=SimpleNamespace(hidden={behind.ref.key: behind}),
+        old_with_hidden_members=lambda: [prior, behind],
+    )
+    breaker = object.__new__(CycleBreaker)
+    breaker.apply_order = ["a", "b"]
+
+    assert breaker.cycle_break_edges(squasher) == [("a", "0001_original", "b", "0005_x")]
+
+
+def test_run_before_onto_a_file_behind_a_young_squash_stays(make_migration):
+    # The target hides behind a squash that is not folded, so it keeps its place.
+    target = make_migration("b", "0001_original")
+    source = make_migration("a", "0002_x")
+    source.run_before.append(target.ref)
+    squasher = SimpleNamespace(
+        old={source.ref.key: source},
+        tree=SimpleNamespace(hidden={target.ref.key: target}),
+        old_with_hidden_members=lambda: [source],
+    )
+    breaker = object.__new__(CycleBreaker)
+    breaker.apply_order = ["b", "a"]
+
+    assert breaker.run_before_break_edges(squasher) == []
+
+
+def test_young_run_before_onto_a_file_behind_a_prior_squash_is_refused(make_migration):
+    behind = make_migration("core", "0001_original")
+    prior = make_migration("core", "0001_squash_2025_01_01_initial", commit_date=OLD_DATE, replaces=[behind.ref])
+    young = make_migration("other", "0005_young", commit_date=YOUNG_DATE)
+    young.run_before.append(behind.ref)
+    tree = loading.MigrationTree({m.ref.key: m for m in (prior, young)}, Config(), hidden={behind.ref.key: behind})
+
+    with pytest.raises(RuntimeError, match="must run before folded"):
+        planning.Squasher(tree, CUTOFF, min_young=0)

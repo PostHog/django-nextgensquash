@@ -50,6 +50,28 @@ def _managed_table_names() -> frozenset[str]:
     return frozenset(m._meta.db_table.lower() for m in dj_apps.get_models() if m._meta.managed)
 
 
+@lru_cache(maxsize=1)
+def _managed_table_columns() -> dict[str, frozenset[str]]:
+    """Column names per managed table in the final state, keyed by lowercase table name."""
+    from django.apps import apps as dj_apps
+
+    return {
+        m._meta.db_table.lower(): frozenset(f.column for f in m._meta.concrete_fields if f.column)
+        for m in dj_apps.get_models()
+        if m._meta.managed
+    }
+
+
+def _model_db_table(app_label: str, model_name: str) -> str | None:
+    """Lowercase table name of a model in the final state, or None when it is gone."""
+    from django.apps import apps as dj_apps
+
+    try:
+        return dj_apps.get_model(app_label, model_name)._meta.db_table.lower()
+    except LookupError:
+        return None
+
+
 def _migration_aliases(app_label: str) -> frozenset[str]:
     """Database aliases the project's router lets this app migrate on."""
     return frozenset(alias for alias in connections if router.allow_migrate(alias, app_label))
@@ -354,11 +376,11 @@ class Emitter:
         MigrationWriter doesn't serialize run_before, so FileWriter injects it.
         """
         out: set[tuple[str, str]] = set()
-        for m in self.squasher.old.values():
+        for m in self.squasher.old_with_hidden_members():
             if m.ref.app != self.app:
                 continue
             for rb in m.run_before:
-                if rb.key not in self.squasher.old:
+                if not self.squasher.is_folded(rb.key):
                     out.add(rb.key)
         return sorted(out)
 
@@ -390,21 +412,38 @@ class Emitter:
                     best[dep.app] = dep.name
         return sorted(best.items())
 
-    def _replaces(self) -> list[tuple[str, str]]:
+    def _claimable_keys(self) -> set[tuple[str, str]]:
+        """Every old migration of this app, plus the transitive members of any
+        squash already on disk. A node that a prior squash replaces is not in
+        the loader graph, but its name is still recorded on live databases."""
+        out: set[tuple[str, str]] = set()
+        for m in self.squasher.old.values():
+            if m.ref.app != self.app:
+                continue
+            out.add(m.ref.key)
+            out.update(r.key for r in m.replaces)
+        return out
+
+    def _replaces(self, emit_stub: bool) -> list[tuple[str, str]]:
         """Claim every old migration for this app, including the transitive
         members of any squash already on disk. Install will strip `replaces` from
         those existing squashes so Django sees them as plain migrations — then
         our single fold removes them all from the graph cleanly.
         """
-        out: list[tuple[str, str]] = []
-        for m in self.squasher.old.values():
-            if m.ref.app != self.app:
-                continue
-            out.append(m.ref.key)
-            out.extend(r.key for r in m.replaces)
         # Names the stub claims belong to exactly one replacement node.
-        stub_claims = set(self.config.stub_claims.get(self.app, ()))
-        return sorted(set(out) - stub_claims)
+        excluded = set(self.config.stub_claims.get(self.app, ()))
+        if emit_stub:
+            # A prior phase's stub has the same name as the stub emitted now.
+            # Claiming it would remove the new stub from the graph.
+            excluded.add((self.app, self.STUB_NAME))
+        return sorted(self._claimable_keys() - excluded)
+
+    # The existence guard wrapped around each forwarded FK add, as written below.
+    FK_GUARD_RE = re.compile(
+        r"DO \$\$ BEGIN IF NOT EXISTS \(SELECT 1 FROM pg_constraint WHERE conname = '[^']+'\) THEN\n"
+        r"(.*?);\nEND IF; END \$\$",
+        re.S,
+    )
 
     EXTENSION_OP_NAMES: frozenset[str] = frozenset(
         {
@@ -479,6 +518,9 @@ class Emitter:
         for mig_name, op in self._claimed_ops():
             kind = op.__class__.__name__
             if kind == "AddForeignKeyNotValid":
+                if not self._model_has_column(op.model_name, op.column):
+                    self.dropped_runsql.append(f"{self.app}.{mig_name} [dead-column]: {op.name}")
+                    continue
                 available.add(op.name)
                 out.append(op)
             elif kind in self.STATELESS_CONSTRAINT_OP_NAMES:
@@ -487,6 +529,11 @@ class Emitter:
                 else:
                     self.dropped_runsql.append(f"{self.app}.{mig_name} [unpaired-validate]: {op.name}")
         return out
+
+    def _model_has_column(self, model_name: str, column: str) -> bool:
+        """Whether this app's model still has `column` in the final state."""
+        table = _model_db_table(self.app, model_name)
+        return table is not None and column in _managed_table_columns().get(table, frozenset())
 
     @staticmethod
     def _runsql_statements(op: Any) -> list[tuple[str, Any | None]]:
@@ -528,6 +575,76 @@ class Emitter:
                     if isinstance(name, str):
                         out.add(name)
         return out
+
+    @staticmethod
+    def _index_elements(sql: str, after: int) -> list[str]:
+        """The top-level elements of a CREATE INDEX column list, read from `after`
+        (the end of its `ON table` part)."""
+        start = sql.find("(", after)
+        if start == -1:
+            return []
+        depth, elements, current = 0, [], ""
+        for ch in sql[start + 1 :]:
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                if depth == 0:
+                    break
+                depth -= 1
+            if ch == "," and depth == 0:
+                elements.append(current)
+                current = ""
+            else:
+                current += ch
+        elements.append(current)
+        return [e.strip() for e in elements if e.strip()]
+
+    @staticmethod
+    def _index_is_dead(sql: str, after: int, columns: frozenset[str], dropped: set[str]) -> bool:
+        """Whether a CREATE INDEX needs a column the final state lacks. Bare key
+        columns are checked against the table's columns. Everything after the
+        table (expressions, INCLUDE, WHERE) is checked only against columns that
+        claimed migrations removed, since its other words can be functions,
+        casts, operator classes, or keywords."""
+        for element in Emitter._index_elements(sql, after):
+            if "(" not in element and element.split()[0].strip('"') not in columns:
+                return True
+        # String literals are values, not column references.
+        tail = re.sub(r"'(?:[^']|'')*'", "''", sql[after:])
+        return any(word in dropped for word in re.findall(r'"?([A-Za-z_][A-Za-z0-9_]*)"?', tail))
+
+    def _dropped_columns(self) -> dict[str, set[str]]:
+        """Columns that claimed migrations remove, by lowercase table name: raw
+        DROP COLUMN statements, and RemoveField and RenameField ops (a foreign
+        key's column is the field name plus `_id`, so both names count). A
+        custom `db_column` on a removed field is not seen here."""
+        out: dict[str, set[str]] = {}
+        for _mig_name, op in self._claimed_ops():
+            if isinstance(op, (dj_migrations.RemoveField, dj_migrations.RenameField)):
+                table = _model_db_table(self.app, op.model_name)
+                gone = op.name if isinstance(op, dj_migrations.RemoveField) else op.old_name
+                if table is not None:
+                    out.setdefault(table, set()).update({gone, f"{gone}_id"})
+            elif isinstance(op, dj_migrations.RunSQL):
+                for stmt in self._runsql_text(op).split(";"):
+                    table_match = re.search(
+                        r"ALTER\s+TABLE\s+(?:IF\s+EXISTS\s+)?(?:ONLY\s+)?\"?(\w+)\"?", stmt, re.IGNORECASE
+                    )
+                    if table_match is None:
+                        continue
+                    names = re.findall(r"DROP\s+COLUMN\s+(?:IF\s+EXISTS\s+)?\"?(\w+)\"?", stmt, re.IGNORECASE)
+                    out.setdefault(table_match.group(1).lower(), set()).update(names)
+        return out
+
+    @staticmethod
+    def _fk_names_dead_column(stmt: str, table: str) -> bool:
+        """True when an `ADD CONSTRAINT ... FOREIGN KEY (cols)` names a column
+        that `table` lacks in the final state (a later raw DROP COLUMN)."""
+        match = re.search(r"FOREIGN\s+KEY\s*\(([^)]*)\)", stmt, re.IGNORECASE)
+        if match is None:
+            return False
+        columns = _managed_table_columns().get(table, frozenset())
+        return any(c.strip().strip('"') not in columns for c in match.group(1).split(","))
 
     @staticmethod
     def _ensure_idempotent_create_index(sql: str) -> str:
@@ -574,6 +691,7 @@ class Emitter:
         """
         meta_index_names = self._final_state_index_names()
         managed_tables = _managed_table_names()
+        dropped_columns = self._dropped_columns()
 
         kept: list[Any | None] = []
         create_position: dict[str, int] = {}
@@ -604,7 +722,10 @@ class Emitter:
                 and "DROP TABLE" not in sql_upper
             ):
                 forwarded_stmts: list[str] = []
-                for stmt in sql_text.split(";"):
+                # A prior squash's addons already hold guarded adds. Unwrap them
+                # first: splitting on ";" cuts a guard block apart, and the piece
+                # with the ALTER would get a second guard around the first.
+                for stmt in self.FK_GUARD_RE.sub(r"\1;", sql_text).split(";"):
                     stmt = stmt.strip()
                     if not stmt:
                         continue
@@ -618,6 +739,9 @@ class Emitter:
                         self.dropped_runsql.append(f"{self.app}.{mig_name} [unmanaged-table]: {stmt[:160]}")
                         continue
                     if cmatch and "FOREIGN KEY" in stmt_upper and "ADD COLUMN" not in stmt_upper:
+                        if tmatch and self._fk_names_dead_column(stmt, tmatch.group(1).lower()):
+                            self.dropped_runsql.append(f"{self.app}.{mig_name} [dead-column]: {stmt[:160]}")
+                            continue
                         cname = cmatch.group(1)
                         self._forwarded_fk_constraint_names.add(cname)
                         forwarded_stmts.append(
@@ -665,6 +789,13 @@ class Emitter:
                 continue  # CreateModel(options=...) already covers it
             if table_name not in managed_tables:
                 continue  # target table isn't created by our squash (managed=False)
+            # A later raw DROP COLUMN leaves the final state without the column,
+            # and the forwarded create would fail on a fresh database.
+            table_columns = _managed_table_columns().get(table_name, frozenset())
+            dropped = dropped_columns.get(table_name, set()) - table_columns
+            if self._index_is_dead(sql_text, create_match.end(), table_columns, dropped):
+                self.dropped_runsql.append(f"{self.app}.{mig_name} [dead-column]: {sql_text[:160]}")
+                continue
             # Wrap CREATE INDEX with IF NOT EXISTS so it's safe to run
             # after a CreateModel that may have auto-created an FK index
             # with the same name.
@@ -814,12 +945,24 @@ class Emitter:
             create, _, _, _ = self._create_model_op(ms, set())
             stub_ops.append(create)
         configured_claims = self.config.stub_claims.get(self.app, ())
-        stub_claims = [key for key in configured_claims if key in self.squasher.old]
+        claimable = self._claimable_keys()
+        stub_claims = [key for key in configured_claims if key in claimable]
         if len(stub_claims) != len(configured_claims):
             # An empty-replaces stub fails check_consistent_history on every
             # live DB; that must never happen silently.
             missing = sorted(set(configured_claims) - set(stub_claims))
             raise RuntimeError(f"stub claim(s) not in the old partition for {self.app}: {missing}")
+        # A stub without claims is a plain migration that no live database has
+        # applied, while check_replacements stamps the initial that depends on
+        # it, so check_consistent_history fails on every existing database.
+        # Without claims the extension ops lead the initial instead. A prior
+        # phase's stub is the exception: live databases recorded its name, which
+        # the new stub reuses.
+        emit_stub = bool(stub_claims) or (self.app, self.STUB_NAME) in self.squasher.old
+        if not emit_stub and early_models:
+            raise RuntimeError(
+                f"{self.app} lists early models but no stub claims; a stub without claims breaks live databases"
+            )
         stub = SquashFile(
             app=self.app,
             name=self.STUB_NAME,
@@ -830,7 +973,7 @@ class Emitter:
 
         rest_models = [ms for ms in self._models_in_app() if ms.name.lower() not in early_model_names]
         models = self._sort_models_topologically(rest_models, skip_by_model)
-        initial_ops: list[Any] = []
+        initial_ops: list[Any] = [] if emit_stub else list(stub_ops)
         deferred_indexes: list[tuple[str, Any]] = []  # (model_name_lower, Index)
         deferred_constraints: list[tuple[str, Any]] = []  # (model_name_lower, Constraint)
         deferred_togethers: list[tuple[str, str, Any]] = []  # (model_name_lower, option_key, full_value)
@@ -841,14 +984,6 @@ class Emitter:
             deferred_indexes.extend((ms.name.lower(), idx) for idx in idxs)
             deferred_constraints.extend((ms.name.lower(), c) for c in cons)
             deferred_togethers.extend((ms.name.lower(), key, full) for key, full in togethers)
-        # An empty stub (no extensions, no early models, no claims) is left out.
-        # It would be a real unapplied migration that no plan reaches on an
-        # existing database once the app's leaf is applied: `migrate <app>`
-        # plans nothing, check_replacements then records the initial, and the
-        # next run fails check_consistent_history on the unapplied parent.
-        # Seen on product-routed databases, where no other app's tail pulls
-        # the stub into the plan.
-        emit_stub = bool(stub_ops or stub_claims)
         # Initial's dependencies: stub (when emitted) + cross-app FK targets in
         # the foreign-app latest-old migration.
         initial_deps: list[tuple[str, str]] = [(self.app, self.STUB_NAME)] if emit_stub else []
@@ -861,7 +996,7 @@ class Emitter:
             name=self.INITIAL_NAME,
             operations=initial_ops,
             dependencies=initial_deps,
-            replaces=self._replaces(),
+            replaces=self._replaces(emit_stub),
             run_before=self._carried_run_before(),
         )
 

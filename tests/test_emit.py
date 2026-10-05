@@ -7,6 +7,7 @@ import pytest
 from django.conf import settings
 from django.db import migrations, models
 
+from nextgensquash import loading
 from nextgensquash.emit import Emitter, FileWriter, SquashFile
 
 DEFERRED = {("thing", "team")}
@@ -76,6 +77,7 @@ def _forwarder(monkeypatch, claimed: list[tuple[str, migrations.RunSQL]]) -> Emi
     monkeypatch.setattr(emitter, "_claimed_ops", lambda: iter(claimed))
     monkeypatch.setattr(emitter, "_final_state_index_names", lambda: set())
     monkeypatch.setattr("nextgensquash.emit._managed_table_names", lambda: frozenset({"app_thing"}))
+    monkeypatch.setattr("nextgensquash.emit._managed_table_columns", lambda: {"app_thing": frozenset({"a", "b"})})
     return emitter
 
 
@@ -185,3 +187,155 @@ def test_run_before_is_written_only_once_the_squash_replaces_nothing(tmp_path, r
     text = FileWriter(tmp_path).write(squash).read_text()
 
     assert ('("oauth2_provider", "0001_initial")' in text) is writes_run_before
+
+
+def _restack_emitter(make_migration) -> Emitter:
+    # Phase N over phase N-1: the old stub already claims the root that the config names.
+    hidden_root = loading.MigrationRef(app="app", name="0001_initial_squashed_0010")
+    old = [
+        make_migration("app", "0000_squash_stub", replaces=[hidden_root]),
+        make_migration("app", "0001_squash_2026_01_01_initial", replaces=[loading.MigrationRef("app", "0011_x")]),
+        make_migration("app", "0012_y"),
+    ]
+    emitter = object.__new__(Emitter)
+    emitter.app = "app"
+    emitter.config = SimpleNamespace(stub_claims={"app": [hidden_root.key]})
+    emitter.squasher = SimpleNamespace(old={m.ref.key: m for m in old})
+    return emitter
+
+
+def test_stub_claim_hidden_behind_a_prior_stub_stays_claimable(make_migration):
+    assert ("app", "0001_initial_squashed_0010") in _restack_emitter(make_migration)._claimable_keys()
+
+
+@pytest.mark.parametrize(
+    ("emit_stub", "claims_prior_stub"),
+    [
+        (True, False),  # the new stub has the prior stub's name; claiming it drops the new stub
+        (False, True),  # no new stub, so the prior one folds like any old migration
+    ],
+)
+def test_initial_claims_the_prior_stub_only_without_a_new_stub(make_migration, emit_stub, claims_prior_stub):
+    replaces = _restack_emitter(make_migration)._replaces(emit_stub)
+
+    assert (("app", "0000_squash_stub") in replaces) is claims_prior_stub
+    assert ("app", "0001_initial_squashed_0010") not in replaces
+    assert ("app", "0011_x") in replaces
+
+
+def test_forwarded_fk_add_from_a_prior_squash_keeps_one_guard(monkeypatch):
+    add = "ALTER TABLE app_thing ADD CONSTRAINT thing_owner_fk FOREIGN KEY (a, b) REFERENCES app_owner (a, b) NOT VALID"
+    guarded = (
+        "DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'thing_owner_fk') THEN\n"
+        f"{add};\nEND IF; END $$;"
+    )
+    ops = _forwarder(
+        monkeypatch, [("0045_squash_2026_01_01_schema_addons", migrations.RunSQL(guarded))]
+    )._collect_index_runsql_ops()
+
+    assert [op.sql for op in ops] == [guarded]
+
+
+@pytest.mark.parametrize(
+    ("sql", "forwarded"),
+    [
+        ('CREATE INDEX CONCURRENTLY IF NOT EXISTS "idx_gone" ON "app_thing" ("dropped_col")', 0),
+        ('CREATE INDEX "idx_two" ON "app_thing" USING btree ("a", b DESC)', 1),
+        ('CREATE INDEX "idx_expr" ON "app_thing" (lower("a"), (b + 1))', 1),
+    ],
+)
+def test_forwarded_index_on_a_dropped_column_is_left_out(monkeypatch, sql, forwarded):
+    assert len(_forwarder(monkeypatch, [("0001", migrations.RunSQL(sql))])._collect_index_runsql_ops()) == forwarded
+
+
+def test_forwarded_fk_add_on_a_dropped_column_is_left_out(monkeypatch):
+    add = "ALTER TABLE app_thing ADD CONSTRAINT thing_gone_fk FOREIGN KEY (gone_id) REFERENCES app_owner (id) NOT VALID"
+
+    assert _forwarder(monkeypatch, [("0001", migrations.RunSQL(add))])._collect_index_runsql_ops() == []
+
+
+class AddForeignKeyNotValid:
+    # Same class name as the project helper the emitter matches on.
+    def __init__(self, name: str, model_name: str, column: str):
+        self.name, self.model_name, self.column = name, model_name, column
+
+
+class ValidateForeignKey:
+    def __init__(self, name: str):
+        self.name = name
+
+
+def test_fk_helper_on_a_dropped_column_is_left_out_with_its_validate(monkeypatch):
+    emitter = object.__new__(Emitter)
+    emitter.app = "app"
+    emitter.dropped_runsql = []
+    emitter._forwarded_fk_constraint_names = set()
+    claimed = [
+        ("0001", AddForeignKeyNotValid("thing_gone_fk", "thing", "gone_id")),
+        ("0002", ValidateForeignKey("thing_gone_fk")),
+        ("0003", AddForeignKeyNotValid("thing_owner_fk", "thing", "owner_id")),
+    ]
+    monkeypatch.setattr(emitter, "_claimed_ops", lambda: iter(claimed))
+    monkeypatch.setattr(emitter, "_final_state_index_names", lambda: set())
+    monkeypatch.setattr(emitter, "_model_has_column", lambda model_name, column: column == "owner_id")
+
+    assert [op.name for op in emitter._stateless_constraint_ops()] == ["thing_owner_fk"]
+
+
+def test_expression_index_on_a_raw_dropped_column_is_left_out(monkeypatch):
+    claimed = [
+        ("0001", migrations.RunSQL('CREATE INDEX "idx_cast" ON "app_thing" (("legacy_id"::text))')),
+        ("0002", migrations.RunSQL("ALTER TABLE app_thing DROP COLUMN IF EXISTS legacy_id")),
+    ]
+    assert _forwarder(monkeypatch, claimed)._collect_index_runsql_ops() == []
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        'CREATE INDEX "idx_incl" ON "app_thing" ("a") INCLUDE ("legacy_id")',
+        'CREATE INDEX "idx_pred" ON "app_thing" ("a") WHERE legacy_id IS NOT NULL',
+    ],
+)
+def test_index_clause_on_a_raw_dropped_column_is_left_out(monkeypatch, sql):
+    claimed = [
+        ("0001", migrations.RunSQL(sql)),
+        ("0002", migrations.RunSQL("ALTER TABLE app_thing DROP COLUMN legacy_id")),
+    ]
+    assert _forwarder(monkeypatch, claimed)._collect_index_runsql_ops() == []
+
+
+@pytest.mark.parametrize(
+    ("sql", "dropped_by", "forwarded"),
+    [
+        ('CREATE INDEX "idx_incl" ON "app_thing" ("a") INCLUDE ("legacy")', "remove_field", 0),
+        ('CREATE INDEX "idx_incl" ON "app_thing" ("a") INCLUDE ("legacy")', "rename_field", 0),
+        ('CREATE INDEX "idx_lit" ON "app_thing" ("a") WHERE b = \'legacy_id\'', "raw_sql", 1),
+    ],
+)
+def test_dropped_column_check_follows_remove_field_and_skips_literals(monkeypatch, sql, dropped_by, forwarded):
+    drop = {
+        "remove_field": migrations.RemoveField(model_name="thing", name="legacy"),
+        "rename_field": migrations.RenameField(model_name="thing", old_name="legacy", new_name="current"),
+        "raw_sql": migrations.RunSQL("ALTER TABLE app_thing DROP COLUMN legacy_id"),
+    }[dropped_by]
+    monkeypatch.setattr("nextgensquash.emit._model_db_table", lambda app_label, model_name: "app_thing")
+
+    assert (
+        len(_forwarder(monkeypatch, [("0001", migrations.RunSQL(sql)), ("0002", drop)])._collect_index_runsql_ops())
+        == forwarded
+    )
+
+
+def test_run_before_of_a_file_behind_a_prior_squash_is_carried(make_migration):
+    behind = make_migration("app", "0001_original")
+    behind.run_before.append(loading.MigrationRef("oauth2_provider", "0001_initial"))
+    prior = make_migration("app", "0001_squash_2026_01_01_initial", replaces=[behind.ref])
+    emitter = object.__new__(Emitter)
+    emitter.app = "app"
+    emitter.squasher = SimpleNamespace(
+        old_with_hidden_members=lambda: [prior, behind],
+        is_folded=lambda key: key in {prior.ref.key, behind.ref.key},
+    )
+
+    assert emitter._carried_run_before() == [("oauth2_provider", "0001_initial")]

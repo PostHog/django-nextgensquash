@@ -49,12 +49,28 @@ class Squasher:
         self.SQUASH_NAME = f"0001_squash_{cutoff.isoformat().replace('-', '_')}_initial"
         self.include_prior_squashes = include_prior_squashes
         self.old, self.young = tree.partition(cutoff, include_prior_squashes=include_prior_squashes)
+        # Files on disk behind a prior squash in the old set. The fold claims
+        # them too, and a prior squash never moves young, so this stays fixed.
+        self.hidden_folded = {
+            r.key: tree.hidden[r.key] for m in self.old.values() for r in m.replaces if r.key in tree.hidden
+        }
         self._rebalance_min_young(min_young)
         self._pull_sql_referenced_young()
         self._check_run_before_direction()
         self.migration_graph = self._build_migration_graph()
         self.app_graph = self._build_app_graph()
         self.squashes = self._plan_squashes()
+
+    def old_with_hidden_members(self) -> list[loading.Migration]:
+        """Old migrations plus the files on disk that a prior squash among them
+        replaces. Install deletes the prior squash, so the loader then moves
+        those files' edges onto the new squash, and a back edge among them
+        closes a cycle the same way an edge on an old migration does."""
+        return list(self.old.values()) + list(self.hidden_folded.values())
+
+    def is_folded(self, key: tuple[str, str]) -> bool:
+        """Whether the new squash claims this migration, visible or behind a prior squash."""
+        return key in self.old or key in self.hidden_folded
 
     def _rebalance_min_young(self, min_young: int) -> None:
         """Move each app's newest old migrations to young until the app keeps
@@ -107,12 +123,12 @@ class Squasher:
     def _runs_before_old(self, m: loading.Migration) -> bool:
         """True when `run_before` names a folded migration. A young node that must
         run before the squash closes a cycle through the replaces redirect."""
-        return any(rb.key in self.old for rb in m.run_before)
+        return any(self.is_folded(rb.key) for rb in m.run_before)
 
     def _check_run_before_direction(self) -> None:
         for m in self.young.values():
             if self._runs_before_old(m):
-                targets = ", ".join(str(rb) for rb in m.run_before if rb.key in self.old)
+                targets = ", ".join(str(rb) for rb in m.run_before if self.is_folded(rb.key))
                 raise RuntimeError(
                     f"{m.ref} is young but must run before folded {targets} — bump the cutoff past {m.ref}"
                 )

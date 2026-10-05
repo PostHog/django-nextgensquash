@@ -58,8 +58,11 @@ def _run_install(args: argparse.Namespace) -> None:
         squash_paths: list[Path] = []
         for src in (app_dir / "migrations").glob("*.py"):
             dest = target_dir / src.name
+            # A file we overwrite (a prior phase's same-named stub) is tracked:
+            # uninstall must restore it from git, not delete it.
+            overwrites = dest.exists()
             dest.write_text(src.read_text())
-            installed.append(dest)
+            (deleted if overwrites else installed).append(dest)
             squash_paths.append(dest)
         apps_processed.append((app, target_dir, squash_paths))
         for retired in _strip_replaces_from_claimed_squashes(squash_paths, target_dir):
@@ -123,6 +126,9 @@ def _strip_replaces_from_claimed_squashes(squash_paths: list[Path], target_dir: 
     name the old squash claimed in its own `replaces=` — Django doesn't need the
     file to exist to honour the redirect. Leaving the file in place was causing
     `manage.py sqlmigrate posthog 0001` ambiguity in CI (two 0001_*.py files).
+    Deleting also makes Django refuse a database that applied only part of the
+    folded range: the loader raises NodeNotFoundError before any migration runs.
+    Django 5.2 cannot keep the old squash as a nested replacement instead.
 
     Recognising a squash: load it as a module and check `Migration.replaces`.
     Skip files we just wrote ourselves.
