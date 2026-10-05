@@ -10,7 +10,7 @@ from typing import Any
 
 from django.conf import settings
 
-from nextgensquash import retire
+from nextgensquash import loading, retire
 from nextgensquash.config import app_migration_dirs, project_root
 
 
@@ -122,12 +122,13 @@ def _strip_cycle_edges_from_migrations(edges: list[tuple[str, str, str, str, str
 
 def _strip_replaces_from_claimed_squashes(squash_paths: list[Path], target_dir: Path) -> list[Path]:
     """For each pre-existing squash file in `target_dir` that's claimed by any
-    of our new squashes, empty its `replaces=` and keep the file. Django cannot
-    hold a squash inside another squash: the loader walks replacements in an
-    arbitrary order and fails when the outer one removed the inner node first.
-    As a plain migration the old squash stays on disk for databases that applied
-    it but not everything after it. Those fall back to the replaced files, and
-    their newer migrations still find this parent.
+    of our new squashes, delete it. Our new squash already lists every migration
+    name the old squash claimed in its own `replaces=` — Django doesn't need the
+    file to exist to honour the redirect. Leaving the file in place was causing
+    `manage.py sqlmigrate posthog 0001` ambiguity in CI (two 0001_*.py files).
+    Deleting also makes Django refuse a database that applied only part of the
+    folded range: the loader raises NodeNotFoundError before any migration runs.
+    Django 5.2 cannot keep the old squash as a nested replacement instead.
 
     Recognising a squash: load it as a module and check `Migration.replaces`.
     Skip files we just wrote ourselves.
@@ -167,17 +168,24 @@ def _strip_replaces_from_claimed_squashes(squash_paths: list[Path], target_dir: 
         # place — Django folds them via our squash's replaces= list. We delete
         # the squash files themselves so they don't create `sqlmigrate` prefix
         # ambiguity or graph collisions with our newly emitted squash files.
-        # A claimed squash, prior-phase output or a HISTORICAL one (e.g.
-        # posthog's ancient 0001_initial_squashed_0284_*), keeps its file but
-        # must lose its `replaces=`: our fold removes its node from the graph,
-        # and the loader then crashes resolving that node's own replacement
-        # entry (NodeNotFoundError). Emptying replaces makes it a plain
-        # migration our fold removes cleanly. Safe: check_replacements stamped
-        # its name on every live DB that applied it.
+        if not loading.MigrationTree._PRIOR_SQUASH_RE.search(p.stem):
+            # A claimed HISTORICAL squash (e.g. posthog's ancient
+            # 0001_initial_squashed_0284_*) keeps its file but must lose its
+            # `replaces=`: our fold removes its node from the graph, and the
+            # loader then crashes resolving that node's own replacement entry
+            # (NodeNotFoundError). Emptying replaces makes it a plain
+            # migration our fold removes cleanly. Safe: check_replacements
+            # stamped its name on every live DB years ago.
+            mod = load_module(p)
+            if mod is not None and (getattr(mod.Migration, "replaces", []) or []):
+                if retire._empty_replaces_in_squash(p):
+                    deleted.append(p)
+            continue
         mod = load_module(p)
-        if mod is not None and (getattr(mod.Migration, "replaces", []) or []):
-            if retire._empty_replaces_in_squash(p):
-                deleted.append(p)
+        if mod is None:
+            continue
+        p.unlink()
+        deleted.append(p)
     return deleted
 
 

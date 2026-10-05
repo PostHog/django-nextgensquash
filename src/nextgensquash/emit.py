@@ -595,14 +595,16 @@ class Emitter:
         return [e.strip() for e in elements if e.strip()]
 
     @staticmethod
-    def _index_element_is_dead(element: str, columns: frozenset[str], dropped: set[str]) -> bool:
-        """Whether an index element needs a column the final state lacks. A bare
-        column is checked against the table's columns. An expression is checked
-        only against columns a claimed raw DROP COLUMN removed, since its other
-        words can be functions, casts, or operator classes."""
-        if "(" not in element:
-            return element.split()[0].strip('"') not in columns
-        return any(word in dropped for word in re.findall(r'"?([A-Za-z_][A-Za-z0-9_]*)"?', element))
+    def _index_is_dead(sql: str, after: int, columns: frozenset[str], dropped: set[str]) -> bool:
+        """Whether a CREATE INDEX needs a column the final state lacks. Bare key
+        columns are checked against the table's columns. Everything after the
+        table (expressions, INCLUDE, WHERE) is checked only against columns a
+        claimed raw DROP COLUMN removed, since its other words can be functions,
+        casts, operator classes, or keywords."""
+        for element in Emitter._index_elements(sql, after):
+            if "(" not in element and element.split()[0].strip('"') not in columns:
+                return True
+        return any(word in dropped for word in re.findall(r'"?([A-Za-z_][A-Za-z0-9_]*)"?', sql[after:]))
 
     def _raw_dropped_columns(self) -> dict[str, set[str]]:
         """Columns that claimed raw SQL drops, by lowercase table name."""
@@ -775,8 +777,7 @@ class Emitter:
             # and the forwarded create would fail on a fresh database.
             table_columns = _managed_table_columns().get(table_name, frozenset())
             dropped = raw_dropped.get(table_name, set()) - table_columns
-            elements = self._index_elements(sql_text, create_match.end())
-            if any(self._index_element_is_dead(e, table_columns, dropped) for e in elements):
+            if self._index_is_dead(sql_text, create_match.end(), table_columns, dropped):
                 self.dropped_runsql.append(f"{self.app}.{mig_name} [dead-column]: {sql_text[:160]}")
                 continue
             # Wrap CREATE INDEX with IF NOT EXISTS so it's safe to run

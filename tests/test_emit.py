@@ -288,3 +288,18 @@ def test_expression_index_on_a_raw_dropped_column_is_left_out(monkeypatch):
         ("0002", migrations.RunSQL("ALTER TABLE app_thing DROP COLUMN IF EXISTS legacy_id")),
     ]
     assert _forwarder(monkeypatch, claimed)._collect_index_runsql_ops() == []
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        'CREATE INDEX "idx_incl" ON "app_thing" ("a") INCLUDE ("legacy_id")',
+        'CREATE INDEX "idx_pred" ON "app_thing" ("a") WHERE legacy_id IS NOT NULL',
+    ],
+)
+def test_index_clause_on_a_raw_dropped_column_is_left_out(monkeypatch, sql):
+    claimed = [
+        ("0001", migrations.RunSQL(sql)),
+        ("0002", migrations.RunSQL("ALTER TABLE app_thing DROP COLUMN legacy_id")),
+    ]
+    assert _forwarder(monkeypatch, claimed)._collect_index_runsql_ops() == []

@@ -158,3 +158,19 @@ def test_cycle_break_reaches_files_behind_a_prior_squash(make_migration):
     breaker.apply_order = ["a", "b"]
 
     assert breaker.cycle_break_edges(squasher) == [("a", "0001_original", "b", "0005_x")]
+
+
+def test_run_before_onto_a_file_behind_a_young_squash_stays(make_migration):
+    # The target hides behind a squash that is not folded, so it keeps its place.
+    target = make_migration("b", "0001_original")
+    source = make_migration("a", "0002_x")
+    source.run_before.append(target.ref)
+    squasher = SimpleNamespace(
+        old={source.ref.key: source},
+        tree=SimpleNamespace(hidden={target.ref.key: target}),
+        old_with_hidden_members=lambda: [source],
+    )
+    breaker = object.__new__(CycleBreaker)
+    breaker.apply_order = ["b", "a"]
+
+    assert breaker.run_before_break_edges(squasher) == []
