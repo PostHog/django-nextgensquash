@@ -916,8 +916,10 @@ class Emitter:
         # A stub without claims is a plain migration that no live database has
         # applied, while check_replacements stamps the initial that depends on
         # it, so check_consistent_history fails on every existing database.
-        # Without claims the extension ops lead the initial instead.
-        emit_stub = bool(stub_claims)
+        # Without claims the extension ops lead the initial instead. A prior
+        # phase's stub is the exception: live databases recorded its name, which
+        # the new stub reuses.
+        emit_stub = bool(stub_claims) or (self.app, self.STUB_NAME) in self.squasher.old
         if not emit_stub and early_models:
             raise RuntimeError(
                 f"{self.app} lists early models but no stub claims; a stub without claims breaks live databases"
