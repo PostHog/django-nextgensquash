@@ -7,6 +7,7 @@ import pytest
 from django.conf import settings
 from django.db import migrations, models
 
+from nextgensquash import loading
 from nextgensquash.emit import Emitter, FileWriter, SquashFile
 
 DEFERRED = {("thing", "team")}
@@ -185,3 +186,50 @@ def test_run_before_is_written_only_once_the_squash_replaces_nothing(tmp_path, r
     text = FileWriter(tmp_path).write(squash).read_text()
 
     assert ('("oauth2_provider", "0001_initial")' in text) is writes_run_before
+
+
+def _restack_emitter(make_migration) -> Emitter:
+    # Phase N over phase N-1: the old stub already claims the root that the config names.
+    hidden_root = loading.MigrationRef(app="app", name="0001_initial_squashed_0010")
+    old = [
+        make_migration("app", "0000_squash_stub", replaces=[hidden_root]),
+        make_migration("app", "0001_squash_2026_01_01_initial", replaces=[loading.MigrationRef("app", "0011_x")]),
+        make_migration("app", "0012_y"),
+    ]
+    emitter = object.__new__(Emitter)
+    emitter.app = "app"
+    emitter.config = SimpleNamespace(stub_claims={"app": [hidden_root.key]})
+    emitter.squasher = SimpleNamespace(old={m.ref.key: m for m in old})
+    return emitter
+
+
+def test_stub_claim_hidden_behind_a_prior_stub_stays_claimable(make_migration):
+    assert ("app", "0001_initial_squashed_0010") in _restack_emitter(make_migration)._claimable_keys()
+
+
+@pytest.mark.parametrize(
+    ("emit_stub", "claims_prior_stub"),
+    [
+        (True, False),  # the new stub has the prior stub's name; claiming it drops the new stub
+        (False, True),  # no new stub, so the prior one folds like any old migration
+    ],
+)
+def test_initial_claims_the_prior_stub_only_without_a_new_stub(make_migration, emit_stub, claims_prior_stub):
+    replaces = _restack_emitter(make_migration)._replaces(emit_stub)
+
+    assert (("app", "0000_squash_stub") in replaces) is claims_prior_stub
+    assert ("app", "0001_initial_squashed_0010") not in replaces
+    assert ("app", "0011_x") in replaces
+
+
+def test_forwarded_fk_add_from_a_prior_squash_keeps_one_guard(monkeypatch):
+    add = "ALTER TABLE app_thing ADD CONSTRAINT thing_owner_fk FOREIGN KEY (a, b) REFERENCES app_owner (a, b) NOT VALID"
+    guarded = (
+        "DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'thing_owner_fk') THEN\n"
+        f"{add};\nEND IF; END $$;"
+    )
+    ops = _forwarder(
+        monkeypatch, [("0045_squash_2026_01_01_schema_addons", migrations.RunSQL(guarded))]
+    )._collect_index_runsql_ops()
+
+    assert [op.sql for op in ops] == [guarded]

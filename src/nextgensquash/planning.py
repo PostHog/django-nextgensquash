@@ -56,6 +56,16 @@ class Squasher:
         self.app_graph = self._build_app_graph()
         self.squashes = self._plan_squashes()
 
+    def old_with_hidden_members(self) -> list[loading.Migration]:
+        """Old migrations plus the files on disk that a prior squash among them
+        replaces. Install deletes the prior squash, so the loader then moves
+        those files' edges onto the new squash, and a back edge among them
+        closes a cycle the same way an edge on an old migration does."""
+        out = list(self.old.values())
+        for m in self.old.values():
+            out.extend(self.tree.hidden[r.key] for r in m.replaces if r.key in self.tree.hidden)
+        return out
+
     def _rebalance_min_young(self, min_young: int) -> None:
         """Move each app's newest old migrations to young until the app keeps
         `min_young` live migrations after its squash. A pure date cutoff makes

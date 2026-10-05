@@ -152,9 +152,17 @@ class GitDates:
 class MigrationTree:
     """All Django migrations loaded from disk via the MigrationLoader."""
 
-    def __init__(self, migrations: dict[tuple[str, str], Migration], config: Config):
+    def __init__(
+        self,
+        migrations: dict[tuple[str, str], Migration],
+        config: Config,
+        hidden: dict[tuple[str, str], Migration] | None = None,
+    ):
         self.migrations = migrations
         self.config = config
+        # Files on disk that a squash replaces, so the loader keeps them out of
+        # the graph. Only their edges are kept (no dates, no operations).
+        self.hidden = hidden or {}
 
     @staticmethod
     def _discover_files(config: Config) -> list[Path]:
@@ -189,7 +197,20 @@ class MigrationTree:
                 run_before=[MigrationRef(a, n) for (a, n) in (m.run_before or [])],
                 operations=[_summarize_op(op) for op in m.operations],
             )
-        return cls(out, config)
+        hidden: dict[tuple[str, str], Migration] = {}
+        for (app, name), m in loader.disk_migrations.items():
+            if app not in managed or (app, name) in out:
+                continue
+            hidden[(app, name)] = Migration(
+                ref=MigrationRef(app=app, name=name),
+                file_path=Path(inspect.getfile(type(m))).resolve(),
+                commit_date=None,
+                dependencies=[MigrationRef(a, n) for (a, n) in m.dependencies],
+                replaces=[MigrationRef(a, n) for (a, n) in (m.replaces or [])],
+                run_before=[MigrationRef(a, n) for (a, n) in (m.run_before or [])],
+                operations=[],
+            )
+        return cls(out, config, hidden)
 
     # Names emitted by a previous nextgensquash phase. Always treated as old
     # regardless of `commit_date`, so a stacked phase can fold them into its

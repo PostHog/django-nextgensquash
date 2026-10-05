@@ -282,7 +282,7 @@ class CycleBreaker:
         """
         pos = {a: i for i, a in enumerate(self.apply_order)}
         out: list[tuple[str, str, str, str]] = []
-        for m in squasher.old.values():
+        for m in squasher.old_with_hidden_members():
             for dep in m.dependencies:
                 if dep.app == m.ref.app:
                     continue
@@ -304,9 +304,10 @@ class CycleBreaker:
         """
         pos = {a: i for i, a in enumerate(self.apply_order)}
         out: list[tuple[str, str, str, str]] = []
-        for m in squasher.old.values():
+        hidden = squasher.tree.hidden
+        for m in squasher.old_with_hidden_members():
             for rb in m.run_before:
-                if rb.app == m.ref.app or rb.key not in squasher.old:
+                if rb.app == m.ref.app or (rb.key not in squasher.old and rb.key not in hidden):
                     continue
                 if rb.app not in pos or m.ref.app not in pos:
                     continue

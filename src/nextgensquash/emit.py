@@ -390,21 +390,38 @@ class Emitter:
                     best[dep.app] = dep.name
         return sorted(best.items())
 
-    def _replaces(self) -> list[tuple[str, str]]:
+    def _claimable_keys(self) -> set[tuple[str, str]]:
+        """Every old migration of this app, plus the transitive members of any
+        squash already on disk. A node that a prior squash replaces is not in
+        the loader graph, but its name is still recorded on live databases."""
+        out: set[tuple[str, str]] = set()
+        for m in self.squasher.old.values():
+            if m.ref.app != self.app:
+                continue
+            out.add(m.ref.key)
+            out.update(r.key for r in m.replaces)
+        return out
+
+    def _replaces(self, emit_stub: bool) -> list[tuple[str, str]]:
         """Claim every old migration for this app, including the transitive
         members of any squash already on disk. Install will strip `replaces` from
         those existing squashes so Django sees them as plain migrations — then
         our single fold removes them all from the graph cleanly.
         """
-        out: list[tuple[str, str]] = []
-        for m in self.squasher.old.values():
-            if m.ref.app != self.app:
-                continue
-            out.append(m.ref.key)
-            out.extend(r.key for r in m.replaces)
         # Names the stub claims belong to exactly one replacement node.
-        stub_claims = set(self.config.stub_claims.get(self.app, ()))
-        return sorted(set(out) - stub_claims)
+        excluded = set(self.config.stub_claims.get(self.app, ()))
+        if emit_stub:
+            # A prior phase's stub has the same name as the stub emitted now.
+            # Claiming it would remove the new stub from the graph.
+            excluded.add((self.app, self.STUB_NAME))
+        return sorted(self._claimable_keys() - excluded)
+
+    # The existence guard wrapped around each forwarded FK add, as written below.
+    FK_GUARD_RE = re.compile(
+        r"DO \$\$ BEGIN IF NOT EXISTS \(SELECT 1 FROM pg_constraint WHERE conname = '[^']+'\) THEN\n"
+        r"(.*?);\nEND IF; END \$\$",
+        re.S,
+    )
 
     EXTENSION_OP_NAMES: frozenset[str] = frozenset(
         {
@@ -604,7 +621,10 @@ class Emitter:
                 and "DROP TABLE" not in sql_upper
             ):
                 forwarded_stmts: list[str] = []
-                for stmt in sql_text.split(";"):
+                # A prior squash's addons already hold guarded adds. Unwrap them
+                # first: splitting on ";" cuts a guard block apart, and the piece
+                # with the ALTER would get a second guard around the first.
+                for stmt in self.FK_GUARD_RE.sub(r"\1;", sql_text).split(";"):
                     stmt = stmt.strip()
                     if not stmt:
                         continue
@@ -814,12 +834,22 @@ class Emitter:
             create, _, _, _ = self._create_model_op(ms, set())
             stub_ops.append(create)
         configured_claims = self.config.stub_claims.get(self.app, ())
-        stub_claims = [key for key in configured_claims if key in self.squasher.old]
+        claimable = self._claimable_keys()
+        stub_claims = [key for key in configured_claims if key in claimable]
         if len(stub_claims) != len(configured_claims):
             # An empty-replaces stub fails check_consistent_history on every
             # live DB; that must never happen silently.
             missing = sorted(set(configured_claims) - set(stub_claims))
             raise RuntimeError(f"stub claim(s) not in the old partition for {self.app}: {missing}")
+        # A stub without claims is a plain migration that no live database has
+        # applied, while check_replacements stamps the initial that depends on
+        # it, so check_consistent_history fails on every existing database.
+        # Without claims the extension ops lead the initial instead.
+        emit_stub = bool(stub_claims)
+        if not emit_stub and early_models:
+            raise RuntimeError(
+                f"{self.app} lists early models but no stub claims; a stub without claims breaks live databases"
+            )
         stub = SquashFile(
             app=self.app,
             name=self.STUB_NAME,
@@ -830,7 +860,7 @@ class Emitter:
 
         rest_models = [ms for ms in self._models_in_app() if ms.name.lower() not in early_model_names]
         models = self._sort_models_topologically(rest_models, skip_by_model)
-        initial_ops: list[Any] = []
+        initial_ops: list[Any] = [] if emit_stub else list(stub_ops)
         deferred_indexes: list[tuple[str, Any]] = []  # (model_name_lower, Index)
         deferred_constraints: list[tuple[str, Any]] = []  # (model_name_lower, Constraint)
         deferred_togethers: list[tuple[str, str, Any]] = []  # (model_name_lower, option_key, full_value)
@@ -841,14 +871,6 @@ class Emitter:
             deferred_indexes.extend((ms.name.lower(), idx) for idx in idxs)
             deferred_constraints.extend((ms.name.lower(), c) for c in cons)
             deferred_togethers.extend((ms.name.lower(), key, full) for key, full in togethers)
-        # An empty stub (no extensions, no early models, no claims) is left out.
-        # It would be a real unapplied migration that no plan reaches on an
-        # existing database once the app's leaf is applied: `migrate <app>`
-        # plans nothing, check_replacements then records the initial, and the
-        # next run fails check_consistent_history on the unapplied parent.
-        # Seen on product-routed databases, where no other app's tail pulls
-        # the stub into the plan.
-        emit_stub = bool(stub_ops or stub_claims)
         # Initial's dependencies: stub (when emitted) + cross-app FK targets in
         # the foreign-app latest-old migration.
         initial_deps: list[tuple[str, str]] = [(self.app, self.STUB_NAME)] if emit_stub else []
@@ -861,7 +883,7 @@ class Emitter:
             name=self.INITIAL_NAME,
             operations=initial_ops,
             dependencies=initial_deps,
-            replaces=self._replaces(),
+            replaces=self._replaces(emit_stub),
             run_before=self._carried_run_before(),
         )
 

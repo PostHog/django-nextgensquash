@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 from datetime import date
+from types import SimpleNamespace
 
 import pytest
 
 from nextgensquash import loading, planning
 from nextgensquash.config import Config
+from nextgensquash.cyclebreak import CycleBreaker
 
 CUTOFF = date(2026, 1, 1)
 OLD_DATE = date(2025, 6, 1)
@@ -141,3 +143,18 @@ def test_max_number_ignores_unnumbered_names(make_migration):
     assert squasher.max_number("core") == 1342
     assert squasher.max_number("other") == 7
     assert squasher.max_number("missing") == 0
+
+
+def test_cycle_break_reaches_files_behind_a_prior_squash(make_migration):
+    # The prior squash is deleted on install, so the file it replaces carries the back edge.
+    behind = make_migration("a", "0001_original", dependencies=[loading.MigrationRef("b", "0005_x")])
+    prior = make_migration("a", "0001_squash_2026_01_01_initial", replaces=[behind.ref])
+    squasher = SimpleNamespace(
+        old={prior.ref.key: prior},
+        tree=SimpleNamespace(hidden={behind.ref.key: behind}),
+        old_with_hidden_members=lambda: [prior, behind],
+    )
+    breaker = object.__new__(CycleBreaker)
+    breaker.apply_order = ["a", "b"]
+
+    assert breaker.cycle_break_edges(squasher) == [("a", "0001_original", "b", "0005_x")]
