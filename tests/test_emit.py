@@ -246,3 +246,37 @@ def test_forwarded_fk_add_from_a_prior_squash_keeps_one_guard(monkeypatch):
 )
 def test_forwarded_index_on_a_dropped_column_is_left_out(monkeypatch, sql, forwarded):
     assert len(_forwarder(monkeypatch, [("0001", migrations.RunSQL(sql))])._collect_index_runsql_ops()) == forwarded
+
+
+def test_forwarded_fk_add_on_a_dropped_column_is_left_out(monkeypatch):
+    add = "ALTER TABLE app_thing ADD CONSTRAINT thing_gone_fk FOREIGN KEY (gone_id) REFERENCES app_owner (id) NOT VALID"
+
+    assert _forwarder(monkeypatch, [("0001", migrations.RunSQL(add))])._collect_index_runsql_ops() == []
+
+
+class AddForeignKeyNotValid:
+    # Same class name as the project helper the emitter matches on.
+    def __init__(self, name: str, model_name: str, column: str):
+        self.name, self.model_name, self.column = name, model_name, column
+
+
+class ValidateForeignKey:
+    def __init__(self, name: str):
+        self.name = name
+
+
+def test_fk_helper_on_a_dropped_column_is_left_out_with_its_validate(monkeypatch):
+    emitter = object.__new__(Emitter)
+    emitter.app = "app"
+    emitter.dropped_runsql = []
+    emitter._forwarded_fk_constraint_names = set()
+    claimed = [
+        ("0001", AddForeignKeyNotValid("thing_gone_fk", "thing", "gone_id")),
+        ("0002", ValidateForeignKey("thing_gone_fk")),
+        ("0003", AddForeignKeyNotValid("thing_owner_fk", "thing", "owner_id")),
+    ]
+    monkeypatch.setattr(emitter, "_claimed_ops", lambda: iter(claimed))
+    monkeypatch.setattr(emitter, "_final_state_index_names", lambda: set())
+    monkeypatch.setattr(emitter, "_model_has_column", lambda model_name, column: column == "owner_id")
+
+    assert [op.name for op in emitter._stateless_constraint_ops()] == ["thing_owner_fk"]

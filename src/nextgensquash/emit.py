@@ -508,6 +508,9 @@ class Emitter:
         for mig_name, op in self._claimed_ops():
             kind = op.__class__.__name__
             if kind == "AddForeignKeyNotValid":
+                if not self._model_has_column(op.model_name, op.column):
+                    self.dropped_runsql.append(f"{self.app}.{mig_name} [dead-column]: {op.name}")
+                    continue
                 available.add(op.name)
                 out.append(op)
             elif kind in self.STATELESS_CONSTRAINT_OP_NAMES:
@@ -516,6 +519,16 @@ class Emitter:
                 else:
                     self.dropped_runsql.append(f"{self.app}.{mig_name} [unpaired-validate]: {op.name}")
         return out
+
+    def _model_has_column(self, model_name: str, column: str) -> bool:
+        """Whether this app's model still has `column` in the final state."""
+        from django.apps import apps as dj_apps
+
+        try:
+            model = dj_apps.get_model(self.app, model_name)
+        except LookupError:
+            return False
+        return column in _managed_table_columns().get(model._meta.db_table.lower(), frozenset())
 
     @staticmethod
     def _runsql_statements(op: Any) -> list[tuple[str, Any | None]]:
@@ -585,6 +598,16 @@ class Emitter:
             if words and "(" not in element:
                 out.append(words[0].strip('"'))
         return out
+
+    @staticmethod
+    def _fk_names_dead_column(stmt: str, table: str) -> bool:
+        """True when an `ADD CONSTRAINT ... FOREIGN KEY (cols)` names a column
+        that `table` lacks in the final state (a later raw DROP COLUMN)."""
+        match = re.search(r"FOREIGN\s+KEY\s*\(([^)]*)\)", stmt, re.IGNORECASE)
+        if match is None:
+            return False
+        columns = _managed_table_columns().get(table, frozenset())
+        return any(c.strip().strip('"') not in columns for c in match.group(1).split(","))
 
     @staticmethod
     def _ensure_idempotent_create_index(sql: str) -> str:
@@ -678,6 +701,9 @@ class Emitter:
                         self.dropped_runsql.append(f"{self.app}.{mig_name} [unmanaged-table]: {stmt[:160]}")
                         continue
                     if cmatch and "FOREIGN KEY" in stmt_upper and "ADD COLUMN" not in stmt_upper:
+                        if tmatch and self._fk_names_dead_column(stmt, tmatch.group(1).lower()):
+                            self.dropped_runsql.append(f"{self.app}.{mig_name} [dead-column]: {stmt[:160]}")
+                            continue
                         cname = cmatch.group(1)
                         self._forwarded_fk_constraint_names.add(cname)
                         forwarded_stmts.append(
