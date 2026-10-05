@@ -572,9 +572,9 @@ class Emitter:
         return out
 
     @staticmethod
-    def _plain_index_columns(sql: str, after: int) -> list[str]:
-        """Bare column names in the column list of a CREATE INDEX, read from `after`
-        (the end of its `ON table` part). Expression elements are skipped."""
+    def _index_elements(sql: str, after: int) -> list[str]:
+        """The top-level elements of a CREATE INDEX column list, read from `after`
+        (the end of its `ON table` part)."""
         start = sql.find("(", after)
         if start == -1:
             return []
@@ -592,11 +592,30 @@ class Emitter:
             else:
                 current += ch
         elements.append(current)
-        out = []
-        for element in elements:
-            words = element.split()
-            if words and "(" not in element:
-                out.append(words[0].strip('"'))
+        return [e.strip() for e in elements if e.strip()]
+
+    @staticmethod
+    def _index_element_is_dead(element: str, columns: frozenset[str], dropped: set[str]) -> bool:
+        """Whether an index element needs a column the final state lacks. A bare
+        column is checked against the table's columns. An expression is checked
+        only against columns a claimed raw DROP COLUMN removed, since its other
+        words can be functions, casts, or operator classes."""
+        if "(" not in element:
+            return element.split()[0].strip('"') not in columns
+        return any(word in dropped for word in re.findall(r'"?([A-Za-z_][A-Za-z0-9_]*)"?', element))
+
+    def _raw_dropped_columns(self) -> dict[str, set[str]]:
+        """Columns that claimed raw SQL drops, by lowercase table name."""
+        out: dict[str, set[str]] = {}
+        for _mig_name, op in self._claimed_ops():
+            if not isinstance(op, dj_migrations.RunSQL):
+                continue
+            for stmt in self._runsql_text(op).split(";"):
+                table = re.search(r"ALTER\s+TABLE\s+(?:IF\s+EXISTS\s+)?(?:ONLY\s+)?\"?(\w+)\"?", stmt, re.IGNORECASE)
+                if table is None:
+                    continue
+                names = re.findall(r"DROP\s+COLUMN\s+(?:IF\s+EXISTS\s+)?\"?(\w+)\"?", stmt, re.IGNORECASE)
+                out.setdefault(table.group(1).lower(), set()).update(names)
         return out
 
     @staticmethod
@@ -654,6 +673,7 @@ class Emitter:
         """
         meta_index_names = self._final_state_index_names()
         managed_tables = _managed_table_names()
+        raw_dropped = self._raw_dropped_columns()
 
         kept: list[Any | None] = []
         create_position: dict[str, int] = {}
@@ -754,7 +774,9 @@ class Emitter:
             # A later raw DROP COLUMN leaves the final state without the column,
             # and the forwarded create would fail on a fresh database.
             table_columns = _managed_table_columns().get(table_name, frozenset())
-            if any(c not in table_columns for c in self._plain_index_columns(sql_text, create_match.end())):
+            dropped = raw_dropped.get(table_name, set()) - table_columns
+            elements = self._index_elements(sql_text, create_match.end())
+            if any(self._index_element_is_dead(e, table_columns, dropped) for e in elements):
                 self.dropped_runsql.append(f"{self.app}.{mig_name} [dead-column]: {sql_text[:160]}")
                 continue
             # Wrap CREATE INDEX with IF NOT EXISTS so it's safe to run

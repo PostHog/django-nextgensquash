@@ -58,8 +58,11 @@ def _run_install(args: argparse.Namespace) -> None:
         squash_paths: list[Path] = []
         for src in (app_dir / "migrations").glob("*.py"):
             dest = target_dir / src.name
+            # A file we overwrite (a prior phase's same-named stub) is tracked:
+            # uninstall must restore it from git, not delete it.
+            overwrites = dest.exists()
             dest.write_text(src.read_text())
-            installed.append(dest)
+            (deleted if overwrites else installed).append(dest)
             squash_paths.append(dest)
         apps_processed.append((app, target_dir, squash_paths))
         for retired in _strip_replaces_from_claimed_squashes(squash_paths, target_dir):

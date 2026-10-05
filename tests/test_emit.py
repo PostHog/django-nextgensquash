@@ -280,3 +280,11 @@ def test_fk_helper_on_a_dropped_column_is_left_out_with_its_validate(monkeypatch
     monkeypatch.setattr(emitter, "_model_has_column", lambda model_name, column: column == "owner_id")
 
     assert [op.name for op in emitter._stateless_constraint_ops()] == ["thing_owner_fk"]
+
+
+def test_expression_index_on_a_raw_dropped_column_is_left_out(monkeypatch):
+    claimed = [
+        ("0001", migrations.RunSQL('CREATE INDEX "idx_cast" ON "app_thing" (("legacy_id"::text))')),
+        ("0002", migrations.RunSQL("ALTER TABLE app_thing DROP COLUMN IF EXISTS legacy_id")),
+    ]
+    assert _forwarder(monkeypatch, claimed)._collect_index_runsql_ops() == []
