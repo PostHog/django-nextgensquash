@@ -50,6 +50,18 @@ def _managed_table_names() -> frozenset[str]:
     return frozenset(m._meta.db_table.lower() for m in dj_apps.get_models() if m._meta.managed)
 
 
+@lru_cache(maxsize=1)
+def _managed_table_columns() -> dict[str, frozenset[str]]:
+    """Column names per managed table in the final state, keyed by lowercase table name."""
+    from django.apps import apps as dj_apps
+
+    return {
+        m._meta.db_table.lower(): frozenset(f.column for f in m._meta.concrete_fields if f.column)
+        for m in dj_apps.get_models()
+        if m._meta.managed
+    }
+
+
 def _migration_aliases(app_label: str) -> frozenset[str]:
     """Database aliases the project's router lets this app migrate on."""
     return frozenset(alias for alias in connections if router.allow_migrate(alias, app_label))
@@ -547,6 +559,34 @@ class Emitter:
         return out
 
     @staticmethod
+    def _plain_index_columns(sql: str, after: int) -> list[str]:
+        """Bare column names in the column list of a CREATE INDEX, read from `after`
+        (the end of its `ON table` part). Expression elements are skipped."""
+        start = sql.find("(", after)
+        if start == -1:
+            return []
+        depth, elements, current = 0, [], ""
+        for ch in sql[start + 1 :]:
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                if depth == 0:
+                    break
+                depth -= 1
+            if ch == "," and depth == 0:
+                elements.append(current)
+                current = ""
+            else:
+                current += ch
+        elements.append(current)
+        out = []
+        for element in elements:
+            words = element.split()
+            if words and "(" not in element:
+                out.append(words[0].strip('"'))
+        return out
+
+    @staticmethod
     def _ensure_idempotent_create_index(sql: str) -> str:
         """Rewrite `CREATE INDEX ... ` to `CREATE INDEX IF NOT EXISTS ...` so
         forwarded RunSQL is safe when Django's own CreateModel already produced
@@ -685,6 +725,12 @@ class Emitter:
                 continue  # CreateModel(options=...) already covers it
             if table_name not in managed_tables:
                 continue  # target table isn't created by our squash (managed=False)
+            # A later raw DROP COLUMN leaves the final state without the column,
+            # and the forwarded create would fail on a fresh database.
+            table_columns = _managed_table_columns().get(table_name, frozenset())
+            if any(c not in table_columns for c in self._plain_index_columns(sql_text, create_match.end())):
+                self.dropped_runsql.append(f"{self.app}.{mig_name} [dead-column]: {sql_text[:160]}")
+                continue
             # Wrap CREATE INDEX with IF NOT EXISTS so it's safe to run
             # after a CreateModel that may have auto-created an FK index
             # with the same name.

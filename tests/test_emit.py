@@ -77,6 +77,7 @@ def _forwarder(monkeypatch, claimed: list[tuple[str, migrations.RunSQL]]) -> Emi
     monkeypatch.setattr(emitter, "_claimed_ops", lambda: iter(claimed))
     monkeypatch.setattr(emitter, "_final_state_index_names", lambda: set())
     monkeypatch.setattr("nextgensquash.emit._managed_table_names", lambda: frozenset({"app_thing"}))
+    monkeypatch.setattr("nextgensquash.emit._managed_table_columns", lambda: {"app_thing": frozenset({"a", "b"})})
     return emitter
 
 
@@ -233,3 +234,15 @@ def test_forwarded_fk_add_from_a_prior_squash_keeps_one_guard(monkeypatch):
     )._collect_index_runsql_ops()
 
     assert [op.sql for op in ops] == [guarded]
+
+
+@pytest.mark.parametrize(
+    ("sql", "forwarded"),
+    [
+        ('CREATE INDEX CONCURRENTLY IF NOT EXISTS "idx_gone" ON "app_thing" ("dropped_col")', 0),
+        ('CREATE INDEX "idx_two" ON "app_thing" USING btree ("a", b DESC)', 1),
+        ('CREATE INDEX "idx_expr" ON "app_thing" (lower("a"), (b + 1))', 1),
+    ],
+)
+def test_forwarded_index_on_a_dropped_column_is_left_out(monkeypatch, sql, forwarded):
+    assert len(_forwarder(monkeypatch, [("0001", migrations.RunSQL(sql))])._collect_index_runsql_ops()) == forwarded
