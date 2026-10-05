@@ -615,14 +615,16 @@ class Emitter:
 
     def _dropped_columns(self) -> dict[str, set[str]]:
         """Columns that claimed migrations remove, by lowercase table name: raw
-        DROP COLUMN statements, and RemoveField ops (a foreign key's column is
-        the field name plus `_id`, so both names count)."""
+        DROP COLUMN statements, and RemoveField and RenameField ops (a foreign
+        key's column is the field name plus `_id`, so both names count). A
+        custom `db_column` on a removed field is not seen here."""
         out: dict[str, set[str]] = {}
         for _mig_name, op in self._claimed_ops():
-            if isinstance(op, dj_migrations.RemoveField):
+            if isinstance(op, (dj_migrations.RemoveField, dj_migrations.RenameField)):
                 table = _model_db_table(self.app, op.model_name)
+                gone = op.name if isinstance(op, dj_migrations.RemoveField) else op.old_name
                 if table is not None:
-                    out.setdefault(table, set()).update({op.name, f"{op.name}_id"})
+                    out.setdefault(table, set()).update({gone, f"{gone}_id"})
             elif isinstance(op, dj_migrations.RunSQL):
                 for stmt in self._runsql_text(op).split(";"):
                     table_match = re.search(

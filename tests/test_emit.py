@@ -309,15 +309,16 @@ def test_index_clause_on_a_raw_dropped_column_is_left_out(monkeypatch, sql):
     ("sql", "dropped_by", "forwarded"),
     [
         ('CREATE INDEX "idx_incl" ON "app_thing" ("a") INCLUDE ("legacy")', "remove_field", 0),
+        ('CREATE INDEX "idx_incl" ON "app_thing" ("a") INCLUDE ("legacy")', "rename_field", 0),
         ('CREATE INDEX "idx_lit" ON "app_thing" ("a") WHERE b = \'legacy_id\'', "raw_sql", 1),
     ],
 )
 def test_dropped_column_check_follows_remove_field_and_skips_literals(monkeypatch, sql, dropped_by, forwarded):
-    drop = (
-        migrations.RemoveField(model_name="thing", name="legacy")
-        if dropped_by == "remove_field"
-        else migrations.RunSQL("ALTER TABLE app_thing DROP COLUMN legacy_id")
-    )
+    drop = {
+        "remove_field": migrations.RemoveField(model_name="thing", name="legacy"),
+        "rename_field": migrations.RenameField(model_name="thing", old_name="legacy", new_name="current"),
+        "raw_sql": migrations.RunSQL("ALTER TABLE app_thing DROP COLUMN legacy_id"),
+    }[dropped_by]
     monkeypatch.setattr("nextgensquash.emit._model_db_table", lambda app_label, model_name: "app_thing")
 
     assert (
