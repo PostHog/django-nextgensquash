@@ -474,11 +474,9 @@ class Emitter:
         }
     )
 
-    def _claimed_ops(self, app: str | None = None) -> Iterator[tuple[str, Any]]:
-        """Yield (migration_name, op) for the claimed migrations of `app` (this
-        app by default) in name order, flattening SeparateDatabaseAndState into
-        its database ops."""
-        app_label = app or self.app
+    def _claimed_ops(self) -> Iterator[tuple[str, Any]]:
+        """Yield (migration_name, op) for this app's claimed migrations in name
+        order, flattening SeparateDatabaseAndState into its database ops."""
 
         def flatten(name: str, ops: list[Any]) -> Iterator[tuple[str, Any]]:
             for op in ops:
@@ -487,8 +485,8 @@ class Emitter:
                 else:
                     yield name, op
 
-        for (node_app, name), m in sorted(self.loader.graph.nodes.items()):
-            if node_app != app_label or (node_app, name) not in self.squasher.old:
+        for (app, name), m in sorted(self.loader.graph.nodes.items()):
+            if app != self.app or (app, name) not in self.squasher.old:
                 continue
             yield from flatten(name, list(m.operations))
 
@@ -527,29 +525,18 @@ class Emitter:
         {"AddForeignKeyNotValid", "ValidateForeignKey", "ValidateConstraint"}
     )
 
-    def _state_owner_app(self, app_label: str, model_name: str) -> str | None:
-        """App that holds the model in the squash state: `app_label` itself, or
-        the one app a folded cross-app state move took it to. None when the
-        model is gone or more than one app has a model with that name. The
-        state, not the model registry: a young move has not happened yet."""
+    def _state_table(self, model_name: str) -> str | None:
+        """Lowercase table of the model in the squash state: this app's model,
+        or the one app a folded cross-app state move took it to. None when the
+        model is gone or more than one app has a model with that name."""
         name = model_name.lower()
-        if (app_label, name) in self.state.models:
-            return app_label
-        owners = {app for app, model in self.state.models if model == name}
-        return owners.pop() if len(owners) == 1 else None
-
-    def _stateless_ops_by_owner(self) -> Iterator[tuple[str, Any]]:
-        """This app's claimed stateless constraint ops, plus the ones another
-        app's claimed migrations ran on a model that a state move later brought
-        here. The op resolves its table through the model in its own app's
-        state, so it must run in the app that owns the model at the end."""
-        for app in sorted({m.ref.app for m in self.squasher.old.values()}):
-            for mig_name, op in self._claimed_ops(app):
-                if op.__class__.__name__ not in self.STATELESS_CONSTRAINT_OP_NAMES:
-                    continue
-                owner = self._state_owner_app(app, op.model_name) or app
-                if owner == self.app:
-                    yield mig_name, op
+        model_state = self.state.models.get((self.app, name))
+        if model_state is None:
+            owners = [ms for (_app, model), ms in self.state.models.items() if model == name]
+            if len(owners) != 1:
+                return None
+            model_state = owners[0]
+        return (model_state.options.get("db_table") or f"{model_state.app_label}_{name}").lower()
 
     def _stateless_constraint_ops(self) -> list[Any]:
         out: list[Any] = []
@@ -557,30 +544,39 @@ class Emitter:
         # produces: a forwarded AddForeignKeyNotValid, a forwarded raw FK-add
         # RunSQL (run before this collector), or a final-state Meta constraint.
         available = set(self._forwarded_fk_constraint_names) | self._final_state_index_names()
-        for mig_name, op in self._stateless_ops_by_owner():
+        for mig_name, op in self._claimed_ops():
             kind = op.__class__.__name__
+            if kind not in self.STATELESS_CONSTRAINT_OP_NAMES:
+                continue
+            table = self._state_table(op.model_name)
             if kind == "AddForeignKeyNotValid":
-                if not self._model_has_column(op.model_name, op.column):
+                if table is None or op.column not in _managed_table_columns().get(table, frozenset()):
                     self.dropped_runsql.append(f"{self.app}.{mig_name} [dead-column]: {op.name}")
                     continue
                 available.add(op.name)
-                out.append(op)
-            elif kind in self.STATELESS_CONSTRAINT_OP_NAMES:
-                if op.name in available:
-                    out.append(op)
-                else:
-                    self.dropped_runsql.append(f"{self.app}.{mig_name} [unpaired-validate]: {op.name}")
+            elif op.name not in available:
+                self.dropped_runsql.append(f"{self.app}.{mig_name} [unpaired-validate]: {op.name}")
+                continue
+            out.append(op if _model_db_table(self.app, op.model_name) is not None else self._raw_sql_op(op, table))
         return out
 
-    def _model_has_column(self, model_name: str, column: str) -> bool:
-        """Whether this app's model still has `column` in the final state. The
-        table name comes from the squash state, where a model that a young
-        migration moves away still belongs to this app."""
-        model_state = self.state.models.get((self.app, model_name.lower()))
-        if model_state is None:
-            return False
-        table = (model_state.options.get("db_table") or f"{self.app}_{model_state.name_lower}").lower()
-        return column in _managed_table_columns().get(table, frozenset())
+    def _raw_sql_op(self, op: Any, table: str | None) -> Any:
+        """The op as raw SQL on `table`. The schema_addons tail runs at the
+        app's leaf, where a model that a later migration moved to another app
+        is gone from this app's state, so the helper op could not resolve it."""
+        if op.__class__.__name__ == "AddForeignKeyNotValid":
+            add = (
+                f'ALTER TABLE "{table}" ADD CONSTRAINT "{op.name}" FOREIGN KEY ("{op.column}") '
+                f'REFERENCES "{op.to_table}" ("{op.to_column}") DEFERRABLE INITIALLY DEFERRED NOT VALID'
+            )
+            sql = (
+                "DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_constraint "
+                f"WHERE conname = '{op.name}') THEN\n{add};\nEND IF; END $$;"
+            )
+        else:
+            # Validating an already valid constraint is a no-op.
+            sql = f'ALTER TABLE "{table}" VALIDATE CONSTRAINT "{op.name}";'
+        return dj_migrations.RunSQL(sql=sql, reverse_sql=dj_migrations.RunSQL.noop)
 
     @staticmethod
     def _runsql_statements(op: Any) -> list[tuple[str, Any | None]]:

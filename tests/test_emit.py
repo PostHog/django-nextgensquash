@@ -301,8 +301,8 @@ class AddForeignKeyNotValid:
 
 
 class ValidateForeignKey:
-    def __init__(self, name: str):
-        self.name = name
+    def __init__(self, name: str, model_name: str = "thing"):
+        self.name, self.model_name = name, model_name
 
 
 def test_fk_helper_on_a_dropped_column_is_left_out_with_its_validate(monkeypatch):
@@ -315,36 +315,42 @@ def test_fk_helper_on_a_dropped_column_is_left_out_with_its_validate(monkeypatch
         ("0002", ValidateForeignKey("thing_gone_fk")),
         ("0003", AddForeignKeyNotValid("thing_owner_fk", "thing", "owner_id")),
     ]
-    monkeypatch.setattr(emitter, "_stateless_ops_by_owner", lambda: iter(claimed))
+    monkeypatch.setattr(emitter, "_claimed_ops", lambda: iter(claimed))
     monkeypatch.setattr(emitter, "_final_state_index_names", lambda: set())
-    monkeypatch.setattr(emitter, "_model_has_column", lambda model_name, column: column == "owner_id")
+    monkeypatch.setattr(emitter, "_state_table", lambda model_name: "app_thing")
+    monkeypatch.setattr("nextgensquash.emit._managed_table_columns", lambda: {"app_thing": frozenset({"owner_id"})})
+    monkeypatch.setattr("nextgensquash.emit._model_db_table", lambda app, model: "app_thing")
 
     assert [op.name for op in emitter._stateless_constraint_ops()] == ["thing_owner_fk"]
 
 
 @pytest.mark.parametrize(
-    ("app", "collected"),
+    ("app_model_at_tail", "forwards_raw_sql"),
     [
-        ("dest", ["moved_fk", "dest_fk"]),  # a state move took `moved` here, so its FK add follows
-        ("src", ["src_fk"]),  # the src table is gone from src's state, the op would crash there
+        (True, False),  # the helper op resolves the model in this app's state at the tail
+        (False, True),  # a later migration moved the model away, so only raw SQL can reach the table
     ],
 )
-def test_stateless_op_follows_its_model_to_the_owning_app(monkeypatch, make_migration, app, collected):
-    claimed = {
-        "dest": [("0001", AddForeignKeyNotValid("dest_fk", "kept", "team_id"))],
-        "src": [
-            ("0001", AddForeignKeyNotValid("moved_fk", "moved", "team_id")),
-            ("0002", AddForeignKeyNotValid("src_fk", "stays", "team_id")),
-        ],
-    }
-    owners = {("src", "moved"): "dest", ("src", "stays"): "src", ("dest", "kept"): "dest"}
+def test_fk_helper_on_a_model_moved_away_is_forwarded_as_raw_sql(monkeypatch, app_model_at_tail, forwards_raw_sql):
     emitter = object.__new__(Emitter)
-    emitter.app = app
-    emitter.squasher = SimpleNamespace(old={(a, "0001"): make_migration(a, "0001") for a in claimed})
-    monkeypatch.setattr(emitter, "_claimed_ops", lambda app=None: iter(claimed[app]))
-    monkeypatch.setattr(emitter, "_state_owner_app", lambda app, model: owners[(app, model)])
+    emitter.app = "app"
+    emitter.dropped_runsql = []
+    emitter._forwarded_fk_constraint_names = set()
+    add = AddForeignKeyNotValid("thing_team_fk", "thing", "team_id")
+    add.to_table, add.to_column = "posthog_team", "id"
+    monkeypatch.setattr(emitter, "_claimed_ops", lambda: iter([("0013", add)]))
+    monkeypatch.setattr(emitter, "_final_state_index_names", lambda: set())
+    monkeypatch.setattr(emitter, "_state_table", lambda model_name: "app_thing")
+    monkeypatch.setattr("nextgensquash.emit._managed_table_columns", lambda: {"app_thing": frozenset({"team_id"})})
+    monkeypatch.setattr(
+        "nextgensquash.emit._model_db_table", lambda app, model: "app_thing" if app_model_at_tail else None
+    )
 
-    assert sorted(op.name for _, op in emitter._stateless_ops_by_owner()) == sorted(collected)
+    [op] = emitter._stateless_constraint_ops()
+
+    assert isinstance(op, migrations.RunSQL) is forwards_raw_sql
+    if forwards_raw_sql:
+        assert 'ALTER TABLE "app_thing" ADD CONSTRAINT "thing_team_fk" FOREIGN KEY ("team_id")' in op.sql
 
 
 def test_expression_index_on_a_raw_dropped_column_is_left_out(monkeypatch):
