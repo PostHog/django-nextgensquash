@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -14,12 +15,21 @@ from nextgensquash import loading, retire
 from nextgensquash.config import app_migration_dirs, project_root
 
 
+def _emitted_nested(output_dir: Path) -> bool:
+    manifest_path = output_dir / "RETIRE_MANIFEST.json"
+    if not manifest_path.exists():
+        return False
+    return bool(json.loads(manifest_path.read_text()).get("nested", False))
+
+
 def _run_install(args: argparse.Namespace) -> None:
     """Copy emitted squash files into real migration dirs, strip claimed
-    squashes' `replaces`, and rewrite the dependencies= entries that create the
-    multi-app dep cycle (per CYCLE_EDGE_REMOVALS.txt from emit).
+    squashes' `replaces` (unless the emit nested them), and rewrite the
+    dependencies= entries that create the multi-app dep cycle (per
+    CYCLE_EDGE_REMOVALS.txt from emit).
     """
     output_dir = args.input_dir
+    nested = _emitted_nested(output_dir)
     installed_log = output_dir / "INSTALLED.txt"
     installed: list[Path] = []
     stripped: list[Path] = []
@@ -65,8 +75,8 @@ def _run_install(args: argparse.Namespace) -> None:
             (deleted if overwrites else installed).append(dest)
             squash_paths.append(dest)
         apps_processed.append((app, target_dir, squash_paths))
-        for retired in _strip_replaces_from_claimed_squashes(squash_paths, target_dir):
-            stripped.append(retired)
+        if not nested:
+            stripped.extend(_strip_replaces_from_claimed_squashes(squash_paths, target_dir))
         # Targeted cycle-break edge removals: edit `dependencies` lists in place.
         app_edges = [e for e in cycle_edges if e[0] == app]
         for edited in _strip_cycle_edges_from_migrations(app_edges, target_dir):

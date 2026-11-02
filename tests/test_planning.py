@@ -185,3 +185,45 @@ def test_young_run_before_onto_a_file_behind_a_prior_squash_is_refused(make_migr
 
     with pytest.raises(RuntimeError, match="must run before folded"):
         planning.Squasher(tree, CUTOFF, min_young=0)
+
+
+def test_nesting_prior_squashes_is_refused_before_django_6(monkeypatch):
+    monkeypatch.setattr(planning.django, "VERSION", (5, 2, 18, "final", 0))
+    tree = loading.MigrationTree({}, Config())
+
+    with pytest.raises(RuntimeError, match="needs Django 6.0"):
+        planning.Squasher(tree, CUTOFF, nest_prior_squashes=True)
+
+
+def test_nested_squash_keeps_a_cross_app_model_move_young(make_migration):
+    move_out = loading.OpInfo(kind="SeparateDatabaseAndState", moved_out=("thing",))
+    move_in = loading.OpInfo(kind="SeparateDatabaseAndState", moved_in=("thing",))
+    migs = [
+        make_migration("src", "0001_initial", commit_date=OLD_DATE),
+        make_migration("src", "0002_create_thing", commit_date=OLD_DATE),
+        make_migration("src", "0003_move_thing_out", commit_date=OLD_DATE, operations=[move_out]),
+        make_migration("dest", "0001_initial", commit_date=OLD_DATE),
+        make_migration("dest", "0002_move_thing_in", commit_date=OLD_DATE, operations=[move_in]),
+        make_migration("dest", "0003_alter_thing", commit_date=OLD_DATE),
+        make_migration("other", "0001_initial", commit_date=OLD_DATE),
+        make_migration("other", "0002_fk_to_thing", commit_date=OLD_DATE),
+    ]
+    by_name = {f"{m.ref.app}.{m.ref.name}": m for m in migs}
+    by_name["src.0002_create_thing"].dependencies = [by_name["src.0001_initial"].ref]
+    by_name["src.0003_move_thing_out"].dependencies = [by_name["src.0002_create_thing"].ref]
+    by_name["dest.0002_move_thing_in"].dependencies = [
+        by_name["dest.0001_initial"].ref,
+        by_name["src.0003_move_thing_out"].ref,
+    ]
+    by_name["dest.0003_alter_thing"].dependencies = [by_name["dest.0002_move_thing_in"].ref]
+    by_name["other.0002_fk_to_thing"].dependencies = [by_name["dest.0003_alter_thing"].ref]
+    tree = loading.MigrationTree({m.ref.key: m for m in migs}, Config())
+
+    squasher = planning.Squasher(tree, CUTOFF, min_young=0, nest_prior_squashes=True)
+
+    assert sorted(f"{a}.{n}" for a, n in squasher.young) == [
+        "dest.0002_move_thing_in",
+        "dest.0003_alter_thing",
+        "other.0002_fk_to_thing",
+        "src.0003_move_thing_out",
+    ]

@@ -189,7 +189,7 @@ def test_run_before_is_written_only_once_the_squash_replaces_nothing(tmp_path, r
     assert ('("oauth2_provider", "0001_initial")' in text) is writes_run_before
 
 
-def _restack_emitter(make_migration) -> Emitter:
+def _restack_emitter(make_migration, nest_prior_squashes: bool = False) -> Emitter:
     # Phase N over phase N-1: the old stub already claims the root that the config names.
     hidden_root = loading.MigrationRef(app="app", name="0001_initial_squashed_0010")
     old = [
@@ -200,7 +200,7 @@ def _restack_emitter(make_migration) -> Emitter:
     emitter = object.__new__(Emitter)
     emitter.app = "app"
     emitter.config = SimpleNamespace(stub_claims={"app": [hidden_root.key]})
-    emitter.squasher = SimpleNamespace(old={m.ref.key: m for m in old})
+    emitter.squasher = SimpleNamespace(old={m.ref.key: m for m in old}, nest_prior_squashes=nest_prior_squashes)
     return emitter
 
 
@@ -223,6 +223,26 @@ def test_initial_claims_the_prior_stub_only_without_a_new_stub(make_migration, e
     assert ("app", "0011_x") in replaces
 
 
+@pytest.mark.parametrize(
+    ("nest_prior_squashes", "claims_prior_initial", "claims_its_member"),
+    [
+        (False, True, True),  # flat: the members are claimed directly and install deletes the prior squash
+        (True, True, False),  # nested: Django resolves the members through the kept prior squash
+    ],
+)
+def test_initial_claims_prior_squash_members_only_when_flat(
+    make_migration, nest_prior_squashes, claims_prior_initial, claims_its_member
+):
+    emitter = _restack_emitter(make_migration, nest_prior_squashes)
+
+    replaces = emitter._replaces(emit_stub=True)
+
+    assert (("app", "0001_squash_2026_01_01_initial") in replaces) is claims_prior_initial
+    assert (("app", "0011_x") in replaces) is claims_its_member
+    # retire deletes every folded file, so the manifest set stays flat either way.
+    assert ("app", "0011_x") in emitter.folded_keys(emit_stub=True)
+
+
 def test_forwarded_fk_add_from_a_prior_squash_keeps_one_guard(monkeypatch):
     add = "ALTER TABLE app_thing ADD CONSTRAINT thing_owner_fk FOREIGN KEY (a, b) REFERENCES app_owner (a, b) NOT VALID"
     guarded = (
@@ -234,6 +254,26 @@ def test_forwarded_fk_add_from_a_prior_squash_keeps_one_guard(monkeypatch):
     )._collect_index_runsql_ops()
 
     assert [op.sql for op in ops] == [guarded]
+
+
+def test_hand_written_guarded_fk_add_is_forwarded_with_its_validate(monkeypatch):
+    sql = """
+    DO $$ BEGIN
+      IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint WHERE conname = 'part_matches_parent'
+      ) THEN
+        ALTER TABLE app_thing ADD CONSTRAINT part_matches_parent FOREIGN KEY (a, b) REFERENCES app_owner (a, b) NOT VALID;
+      END IF;
+    END $$;
+    ALTER TABLE app_thing VALIDATE CONSTRAINT part_matches_parent;
+    """
+    emitter = _forwarder(monkeypatch, [("0070", migrations.RunSQL(sql))])
+
+    [op] = emitter._collect_index_runsql_ops()
+
+    assert "ADD CONSTRAINT part_matches_parent FOREIGN KEY (a, b)" in op.sql
+    assert op.sql.rstrip(";").endswith("ALTER TABLE app_thing VALIDATE CONSTRAINT part_matches_parent")
+    assert emitter.dropped_runsql == []
 
 
 @pytest.mark.parametrize(
@@ -275,11 +315,36 @@ def test_fk_helper_on_a_dropped_column_is_left_out_with_its_validate(monkeypatch
         ("0002", ValidateForeignKey("thing_gone_fk")),
         ("0003", AddForeignKeyNotValid("thing_owner_fk", "thing", "owner_id")),
     ]
-    monkeypatch.setattr(emitter, "_claimed_ops", lambda: iter(claimed))
+    monkeypatch.setattr(emitter, "_stateless_ops_by_owner", lambda: iter(claimed))
     monkeypatch.setattr(emitter, "_final_state_index_names", lambda: set())
     monkeypatch.setattr(emitter, "_model_has_column", lambda model_name, column: column == "owner_id")
 
     assert [op.name for op in emitter._stateless_constraint_ops()] == ["thing_owner_fk"]
+
+
+@pytest.mark.parametrize(
+    ("app", "collected"),
+    [
+        ("dest", ["moved_fk", "dest_fk"]),  # a state move took `moved` here, so its FK add follows
+        ("src", ["src_fk"]),  # the src table is gone from src's state, the op would crash there
+    ],
+)
+def test_stateless_op_follows_its_model_to_the_owning_app(monkeypatch, make_migration, app, collected):
+    claimed = {
+        "dest": [("0001", AddForeignKeyNotValid("dest_fk", "kept", "team_id"))],
+        "src": [
+            ("0001", AddForeignKeyNotValid("moved_fk", "moved", "team_id")),
+            ("0002", AddForeignKeyNotValid("src_fk", "stays", "team_id")),
+        ],
+    }
+    owners = {("src", "moved"): "dest", ("src", "stays"): "src", ("dest", "kept"): "dest"}
+    emitter = object.__new__(Emitter)
+    emitter.app = app
+    emitter.squasher = SimpleNamespace(old={(a, "0001"): make_migration(a, "0001") for a in claimed})
+    monkeypatch.setattr(emitter, "_claimed_ops", lambda app=None: iter(claimed[app]))
+    monkeypatch.setattr(emitter, "_state_owner_app", lambda app, model: owners[(app, model)])
+
+    assert sorted(op.name for _, op in emitter._stateless_ops_by_owner()) == sorted(collected)
 
 
 def test_expression_index_on_a_raw_dropped_column_is_left_out(monkeypatch):

@@ -22,7 +22,11 @@ from nextgensquash.config import Config, project_root
 def _run_plan(args: argparse.Namespace, config: Config) -> None:
     tree = loading.MigrationTree.load(project_root(), config)
     squasher = planning.Squasher(
-        tree, args.cutoff, include_prior_squashes=args.include_prior_squashes, min_young=args.min_young
+        tree,
+        args.cutoff,
+        include_prior_squashes=args.include_prior_squashes,
+        min_young=args.min_young,
+        nest_prior_squashes=args.nest_prior_squashes,
     )
     rendered = planning.TreeRenderer(squasher).render()
     text = yaml.safe_dump(rendered, sort_keys=False, default_flow_style=False, width=200)
@@ -36,7 +40,11 @@ def _run_plan(args: argparse.Namespace, config: Config) -> None:
 def _run_emit(args: argparse.Namespace, config: Config) -> None:
     tree = loading.MigrationTree.load(project_root(), config)
     squasher = planning.Squasher(
-        tree, args.cutoff, include_prior_squashes=args.include_prior_squashes, min_young=args.min_young
+        tree,
+        args.cutoff,
+        include_prior_squashes=args.include_prior_squashes,
+        min_young=args.min_young,
+        nest_prior_squashes=args.nest_prior_squashes,
     )
     state = planning.Snapshotter(squasher).final_state()
     cycle_breaker = cyclebreak.CycleBreaker(state)
@@ -79,6 +87,8 @@ def _run_emit(args: argparse.Namespace, config: Config) -> None:
     # remaps it.
     retire_manifest: dict[str, Any] = {
         "cutoff": args.cutoff.isoformat(),
+        # Install keeps the prior squash files when the initial nests them.
+        "nested": args.nest_prior_squashes,
         "leaves": {},  # app -> post-finalize leaf name
         "initials": {},  # app -> pre-finalize (initial) squash name
         "stubs": {},  # app -> stub name, for the apps that emit one
@@ -117,11 +127,11 @@ def _run_emit(args: argparse.Namespace, config: Config) -> None:
             retire_manifest["leaves"][app] = emitter.FINALIZE_NAME
         else:
             retire_manifest["leaves"][app] = emitter.INITIAL_NAME
-        for replaced_app, replaced_name in initial.replaces:
+        stub = next((sq for sq in squashes if sq.name == emitter.STUB_NAME), None)
+        for replaced_app, replaced_name in emitter.folded_keys(emit_stub=stub is not None):
             retire_manifest["replaced"][f"{replaced_app}/{replaced_name}"] = replaced_app
         if initial.run_before:
             retire_manifest["run_before"][app] = initial.run_before
-        stub = next((sq for sq in squashes if sq.name == emitter.STUB_NAME), None)
         if stub is not None:
             retire_manifest["stubs"][app] = stub.name
             # The stub's claims are moved out of the initial's replaces, so
@@ -197,6 +207,14 @@ def main() -> None:
             help="Treat existing nextgensquash output (stub/initial/finalize_fks/schema_addons) as old "
             "regardless of cutoff date, so a stacked phase-N can fold them into its own replaces list. "
             "Default on. Disable for a clean from-scratch (re-)squash that ignores prior phases.",
+        )
+        p.add_argument(
+            "--nest-prior-squashes",
+            action=argparse.BooleanOptionalAction,
+            default=False,
+            help="Claim each prior squash by its own name instead of flattening its members, and keep "
+            "its files on install. Databases that stopped inside the prior range fall back to it. "
+            "Needs Django 6.0 or later.",
         )
 
     parser_plan = subparsers.add_parser(
