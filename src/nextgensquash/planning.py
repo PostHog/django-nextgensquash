@@ -5,6 +5,7 @@ from __future__ import annotations
 import functools
 import re
 from collections import defaultdict
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import date
 from typing import Any
@@ -33,6 +34,29 @@ class ProposedSquash:
     dropped_runpythons: list[DroppedRunPython]
 
 
+def replaced_closure(
+    migrations: Iterable[loading.Migration], hidden: dict[tuple[str, str], loading.Migration]
+) -> set[tuple[str, str]]:
+    """Every name the given migrations replace, at any depth.
+
+    Django 6 resolves a squash that replaces a squash recursively, so a file
+    behind a squash that is itself behind a squash still hands its edges to the
+    new fold, and its name is still recorded on live databases. A name without a
+    file on disk ends the walk there.
+    """
+    seen: set[tuple[str, str]] = set()
+    pending = [r.key for m in migrations for r in m.replaces]
+    while pending:
+        key = pending.pop()
+        if key in seen:
+            continue
+        seen.add(key)
+        member = hidden.get(key)
+        if member is not None:
+            pending.extend(r.key for r in member.replaces)
+    return seen
+
+
 class Squasher:
     """Plans a new migration tree given an old/young partition."""
 
@@ -59,7 +83,9 @@ class Squasher:
         # Files on disk behind a prior squash in the old set. The fold claims
         # them too, and a prior squash never moves young, so this stays fixed.
         self.hidden_folded = {
-            r.key: tree.hidden[r.key] for m in self.old.values() for r in m.replaces if r.key in tree.hidden
+            key: tree.hidden[key]
+            for key in sorted(replaced_closure(self.old.values(), tree.hidden))
+            if key in tree.hidden
         }
         self._rebalance_min_young(min_young)
         if nest_prior_squashes:

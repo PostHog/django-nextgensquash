@@ -191,16 +191,28 @@ def test_run_before_is_written_only_once_the_squash_replaces_nothing(tmp_path, r
 
 def _restack_emitter(make_migration, nest_prior_squashes: bool = False) -> Emitter:
     # Phase N over phase N-1: the old stub already claims the root that the config names.
+    # Phase N-1 itself nests phase N-2, whose file and its member stay on disk.
     hidden_root = loading.MigrationRef(app="app", name="0001_initial_squashed_0010")
+    grandparent = make_migration(
+        "app", "0001_squash_2025_06_01_initial", replaces=[loading.MigrationRef("app", "0005_deep")]
+    )
     old = [
         make_migration("app", "0000_squash_stub", replaces=[hidden_root]),
-        make_migration("app", "0001_squash_2026_01_01_initial", replaces=[loading.MigrationRef("app", "0011_x")]),
+        make_migration(
+            "app",
+            "0001_squash_2026_01_01_initial",
+            replaces=[grandparent.ref, loading.MigrationRef("app", "0011_x")],
+        ),
         make_migration("app", "0012_y"),
     ]
     emitter = object.__new__(Emitter)
     emitter.app = "app"
     emitter.config = SimpleNamespace(stub_claims={"app": [hidden_root.key]})
-    emitter.squasher = SimpleNamespace(old={m.ref.key: m for m in old}, nest_prior_squashes=nest_prior_squashes)
+    emitter.squasher = SimpleNamespace(
+        old={m.ref.key: m for m in old},
+        nest_prior_squashes=nest_prior_squashes,
+        tree=SimpleNamespace(hidden={grandparent.ref.key: grandparent}),
+    )
     return emitter
 
 
@@ -239,8 +251,9 @@ def test_initial_claims_prior_squash_members_only_when_flat(
 
     assert (("app", "0001_squash_2026_01_01_initial") in replaces) is claims_prior_initial
     assert (("app", "0011_x") in replaces) is claims_its_member
+    assert (("app", "0005_deep") in replaces) is claims_its_member
     # retire deletes every folded file, so the manifest set stays flat either way.
-    assert ("app", "0011_x") in emitter.folded_keys(emit_stub=True)
+    assert {("app", "0011_x"), ("app", "0005_deep")} <= set(emitter.folded_keys(emit_stub=True))
 
 
 def test_forwarded_fk_add_from_a_prior_squash_keeps_one_guard(monkeypatch):

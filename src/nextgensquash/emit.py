@@ -416,13 +416,8 @@ class Emitter:
         """Every old migration of this app, plus the transitive members of any
         squash already on disk. A node that a prior squash replaces is not in
         the loader graph, but its name is still recorded on live databases."""
-        out: set[tuple[str, str]] = set()
-        for m in self.squasher.old.values():
-            if m.ref.app != self.app:
-                continue
-            out.add(m.ref.key)
-            out.update(r.key for r in m.replaces)
-        return out
+        own = [m for m in self.squasher.old.values() if m.ref.app == self.app]
+        return {m.ref.key for m in own} | planning.replaced_closure(own, self.squasher.tree.hidden)
 
     def _replaces_exclusions(self, emit_stub: bool) -> set[tuple[str, str]]:
         # Names the stub claims belong to exactly one replacement node.

@@ -160,6 +160,18 @@ def test_cycle_break_reaches_files_behind_a_prior_squash(make_migration):
     assert breaker.cycle_break_edges(squasher) == [("a", "0001_original", "b", "0005_x")]
 
 
+def test_files_behind_a_nested_prior_squash_fold_at_any_depth(make_migration):
+    deep = make_migration("a", "0001_original", dependencies=[loading.MigrationRef("b", "0005_x")])
+    grandparent = make_migration("a", "0001_squash_2025_01_01_initial", replaces=[deep.ref])
+    parent = make_migration("a", "0001_squash_2025_06_01_initial", commit_date=OLD_DATE, replaces=[grandparent.ref])
+    hidden = {m.ref.key: m for m in (deep, grandparent)}
+    tree = loading.MigrationTree({parent.ref.key: parent}, Config(), hidden=hidden)
+
+    squasher = planning.Squasher(tree, CUTOFF, min_young=0)
+
+    assert {m.ref.key for m in squasher.old_with_hidden_members()} == {parent.ref.key, *hidden}
+
+
 def test_run_before_onto_a_file_behind_a_young_squash_stays(make_migration):
     # The target hides behind a squash that is not folded, so it keeps its place.
     target = make_migration("b", "0001_original")
