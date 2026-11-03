@@ -103,6 +103,13 @@ class Config:
     # package a dev-only tool.
     operations_module: str = "nextgensquash.operations"
 
+    # Path under BASE_DIR of a JSON file that lists every dependency entry an
+    # install removed, across all squash generations. Install merges each run
+    # into it. A database that stops partway through a squash falls back to the
+    # files on disk, which no longer carry these entries, so a migrate gate can
+    # read the list to refuse histories the fallback cannot order. None skips it.
+    removed_dependencies_file: str | None = None
+
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> Config:
         """Build a Config from the `NEXTGENSQUASH` settings dict.
@@ -110,9 +117,17 @@ class Config:
         Keys: IGNORED_APPS (list of app labels), FROZEN_APPS (list of app
         labels), EARLY_MODELS (app label -> list of lowercase model names),
         STUB_CLAIMS (app label -> list of (app, migration name) pairs),
-        OPERATIONS_MODULE (dotted module path, see `operations_module`).
+        OPERATIONS_MODULE (dotted module path, see `operations_module`),
+        REMOVED_DEPENDENCIES_FILE (path under BASE_DIR, see `removed_dependencies_file`).
         """
-        known = {"IGNORED_APPS", "FROZEN_APPS", "EARLY_MODELS", "STUB_CLAIMS", "OPERATIONS_MODULE"}
+        known = {
+            "IGNORED_APPS",
+            "FROZEN_APPS",
+            "EARLY_MODELS",
+            "STUB_CLAIMS",
+            "OPERATIONS_MODULE",
+            "REMOVED_DEPENDENCIES_FILE",
+        }
         unknown = sorted(set(raw) - known)
         if unknown:
             raise ImproperlyConfigured(f"unknown {SETTINGS_KEY} key(s): {', '.join(unknown)}")
@@ -125,6 +140,7 @@ class Config:
                 for app, claims in (raw.get("STUB_CLAIMS") or {}).items()
             },
             operations_module=raw.get("OPERATIONS_MODULE") or cls.operations_module,
+            removed_dependencies_file=raw.get("REMOVED_DEPENDENCIES_FILE") or None,
         )
 
     @classmethod

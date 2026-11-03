@@ -50,3 +50,27 @@ def test_install_keeps_a_claimed_prior_squash_only_when_nested(monkeypatch, tmp_
     install._run_install(argparse.Namespace(input_dir=out))
 
     assert prior.exists() is keeps_prior_squash
+
+
+def test_removed_dependencies_accumulate_across_generations(tmp_path: Path):
+    path = tmp_path / "removed.json"
+    first = ("tasks", "0120_backfill", "canvas", "0016_policy", "dependencies")
+    install._record_removed_dependencies(path, [first], "2026-09-07")
+
+    second = ("alerts", "0009_redact", "cdp", "0005_repair", "run_before")
+    install._record_removed_dependencies(path, [first, second], "2026-11-02")
+
+    assert json.loads(path.read_text())["removed"] == [
+        {
+            "file": ["alerts", "0009_redact"],
+            "entry": ["cdp", "0005_repair"],
+            "attribute": "run_before",
+            "cutoff": "2026-11-02",
+        },
+        {
+            "file": ["tasks", "0120_backfill"],
+            "entry": ["canvas", "0016_policy"],
+            "attribute": "dependencies",
+            "cutoff": "2026-09-07",
+        },
+    ]

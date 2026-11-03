@@ -12,14 +12,39 @@ from typing import Any
 from django.conf import settings
 
 from nextgensquash import loading, retire
-from nextgensquash.config import app_migration_dirs, project_root
+from nextgensquash.config import Config, app_migration_dirs, project_root
+
+# (from_app, from_name, to_app, to_name, attribute)
+CycleEdge = tuple[str, str, str, str, str]
 
 
-def _emitted_nested(output_dir: Path) -> bool:
+def _read_retire_manifest(output_dir: Path) -> dict[str, Any]:
     manifest_path = output_dir / "RETIRE_MANIFEST.json"
     if not manifest_path.exists():
-        return False
-    return bool(json.loads(manifest_path.read_text()).get("nested", False))
+        return {}
+    return json.loads(manifest_path.read_text())
+
+
+def _record_removed_dependencies(path: Path, removed: list[CycleEdge], cutoff: str) -> None:
+    """Merge this install's removed entries into the cumulative list at `path`.
+
+    `file` is the migration that lost the entry and `entry` is the reference it
+    lost from its `attribute` list. For `dependencies` the file is the dependent
+    side; for `run_before` the entry is. An entry already listed keeps the cutoff
+    of the install that first removed it.
+    """
+    existing = json.loads(path.read_text())["removed"] if path.exists() else []
+    seen = {(tuple(e["file"]), tuple(e["entry"]), e["attribute"]) for e in existing}
+    merged = list(existing)
+    for fa, fn, ta, tn, attr in removed:
+        key = ((fa, fn), (ta, tn), attr)
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append({"file": [fa, fn], "entry": [ta, tn], "attribute": attr, "cutoff": cutoff})
+    merged.sort(key=lambda e: (e["file"], e["attribute"], e["entry"]))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"removed": merged}, indent=2) + "\n")
 
 
 def _run_install(args: argparse.Namespace) -> None:
@@ -29,7 +54,8 @@ def _run_install(args: argparse.Namespace) -> None:
     CYCLE_EDGE_REMOVALS.txt from emit).
     """
     output_dir = args.input_dir
-    nested = _emitted_nested(output_dir)
+    retire_manifest = _read_retire_manifest(output_dir)
+    nested = bool(retire_manifest.get("nested", False))
     installed_log = output_dir / "INSTALLED.txt"
     installed: list[Path] = []
     stripped: list[Path] = []
@@ -41,7 +67,7 @@ def _run_install(args: argparse.Namespace) -> None:
     cycle_edges_path = output_dir / "CYCLE_EDGE_REMOVALS.txt"
     # Each line is `from/name -> to/name`, with a trailing ` run_before` when
     # the entry to drop lives in the source file's run_before list.
-    cycle_edges: list[tuple[str, str, str, str, str]] = []
+    cycle_edges: list[CycleEdge] = []
     if cycle_edges_path.exists():
         for line in cycle_edges_path.read_text().splitlines():
             s = line.strip()
@@ -57,6 +83,7 @@ def _run_install(args: argparse.Namespace) -> None:
             cycle_edges.append((fa, fn, ta, tn, attr))
 
     apps_processed: list[tuple[str, Path, list[Path]]] = []
+    removed_edges: list[CycleEdge] = []
     for app_dir in output_dir.iterdir() if output_dir.is_dir() else []:
         if not (app_dir / "migrations").is_dir():
             continue
@@ -79,7 +106,8 @@ def _run_install(args: argparse.Namespace) -> None:
             stripped.extend(_strip_replaces_from_claimed_squashes(squash_paths, target_dir))
         # Targeted cycle-break edge removals: edit `dependencies` lists in place.
         app_edges = [e for e in cycle_edges if e[0] == app]
-        for edited in _strip_cycle_edges_from_migrations(app_edges, target_dir):
+        for edited, edge in _strip_cycle_edges_from_migrations(app_edges, target_dir):
+            removed_edges.append(edge)
             if edited not in deleted:
                 deleted.append(edited)
     leaves = _compute_all_app_graph_leaves([app for app, _, _ in apps_processed])
@@ -93,6 +121,14 @@ def _run_install(args: argparse.Namespace) -> None:
         sys.stderr.write(
             f"{app}: +{len(squash_paths)} squashes  ~{s_count} retired  -{d_count} cycle-break  max->{leaf or '(empty)'}\n"
         )
+
+    removed_file = Config.from_settings().removed_dependencies_file
+    if removed_file and removed_edges:
+        removed_path = project_root() / removed_file
+        # Uninstall restores a tracked list from git and deletes a new one.
+        (deleted if removed_path.exists() else installed).append(removed_path)
+        _record_removed_dependencies(removed_path, removed_edges, retire_manifest.get("cutoff", ""))
+        sys.stderr.write(f"recorded {len(removed_edges)} removed dependency entries in {removed_path}\n")
 
     installed_log.write_text(
         "INSTALLED:\n"
@@ -112,21 +148,23 @@ def _remove_dep_entry(path: Path, dep: tuple[str, str], attr: str = "dependencie
     return retire.transform_dependencies(path, lambda d: None if d == dep else d, attr=attr)
 
 
-def _strip_cycle_edges_from_migrations(edges: list[tuple[str, str, str, str, str]], target_dir: Path) -> list[Path]:
+def _strip_cycle_edges_from_migrations(edges: list[CycleEdge], target_dir: Path) -> list[tuple[Path, CycleEdge]]:
     """For each `(from_app, from_name, to_app, to_name, attr)`, edit
     `target_dir / from_name.py` to remove the single matching entry from its
     `dependencies` (or `run_before`) list. The rest of the file is left untouched.
+    Returns each edited file with the edge removed from it.
     """
 
-    edited: list[Path] = []
-    for _fa, fname, to_app, to_name, attr in edges:
+    edited: list[tuple[Path, CycleEdge]] = []
+    for edge in edges:
+        _fa, fname, to_app, to_name, attr = edge
         p = target_dir / f"{fname}.py"
         if not p.exists():
             continue
         if not _remove_dep_entry(p, (to_app, to_name), attr=attr):
             sys.stderr.write(f"  warning: could not find {attr} entry ({to_app!r}, {to_name!r}) in {p}\n")
             continue
-        edited.append(p)
+        edited.append((p, edge))
     return edited
 
 
