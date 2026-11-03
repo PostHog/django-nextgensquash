@@ -256,6 +256,21 @@ def test_initial_claims_prior_squash_members_only_when_flat(
     assert {("app", "0011_x"), ("app", "0005_deep")} <= set(emitter.folded_keys(emit_stub=True))
 
 
+@pytest.mark.parametrize(
+    ("table", "forwarded"),
+    [
+        ("app_thing", ["ALTER TABLE app_thing SET (autovacuum_vacuum_scale_factor = 0.02);"]),
+        ("app_gone", []),  # a table the squash does not create
+    ],
+)
+def test_storage_parameters_are_forwarded_for_tables_the_squash_creates(monkeypatch, table, forwarded):
+    sql = f"SET LOCAL lock_timeout = '5s';\nALTER TABLE {table} SET (autovacuum_vacuum_scale_factor = 0.02)"
+
+    ops = _forwarder(monkeypatch, [("0178", migrations.RunSQL(sql))])._collect_index_runsql_ops()
+
+    assert [op.sql for op in ops] == forwarded
+
+
 def test_forwarded_fk_add_from_a_prior_squash_keeps_one_guard(monkeypatch):
     add = "ALTER TABLE app_thing ADD CONSTRAINT thing_owner_fk FOREIGN KEY (a, b) REFERENCES app_owner (a, b) NOT VALID"
     guarded = (

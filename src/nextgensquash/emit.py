@@ -720,6 +720,25 @@ class Emitter:
             for stmt, params in Emitter._runsql_statements(op)
         ]
 
+    _STORAGE_PARAMS_RE = re.compile(
+        r"^ALTER\s+TABLE\s+(?:ONLY\s+)?\"?([a-zA-Z0-9_]+)\"?\s+(?:SET|RESET)\s*\(", re.IGNORECASE
+    )
+
+    @classmethod
+    def _storage_param_statements(cls, sql_text: str, managed_tables: frozenset[str]) -> list[str]:
+        """Return the `ALTER TABLE ... SET (...)` and `RESET (...)` statements on tables the squash creates.
+
+        Table storage parameters, such as autovacuum tuning, live outside the model state,
+        so CreateModel cannot reproduce them.
+        """
+        out = []
+        for stmt in sql_text.split(";"):
+            stmt = stmt.strip()
+            match = cls._STORAGE_PARAMS_RE.match(stmt)
+            if match and match.group(1).lower() in managed_tables:
+                out.append(stmt)
+        return out
+
     def _collect_index_runsql_ops(self) -> list[Any]:
         """Return RunSQL ops from claimed migrations that CREATE indexes the
         final-state Meta doesn't already produce. Apply Create/Drop pair
@@ -813,6 +832,14 @@ class Emitter:
                 prior = create_position.pop(consumed, None)
                 if prior is not None:
                     kept[prior] = None  # the constraint owns that index now
+            storage_stmts = self._storage_param_statements(sql_text, managed_tables)
+            if storage_stmts and "CREATE TABLE" not in sql_upper and "DROP TABLE" not in sql_upper:
+                # SET and RESET of a storage parameter give the same result on every run,
+                # so they need no existence guard. Noop reverse, as for the FK adds above.
+                kept.append(
+                    dj_migrations.RunSQL(sql=";\n".join(storage_stmts) + ";", reverse_sql=dj_migrations.RunSQL.noop)
+                )
+                continue
             if any(kw in sql_upper for kw in ("CREATE TABLE", "ALTER TABLE", "DROP TABLE")):
                 self.dropped_runsql.append(f"{self.app}.{mig_name} [table-ddl]: {sql_text[:160]}")
                 continue
