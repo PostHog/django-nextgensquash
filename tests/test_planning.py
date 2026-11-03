@@ -207,7 +207,9 @@ def test_nesting_prior_squashes_is_refused_before_django_6(monkeypatch):
         planning.Squasher(tree, CUTOFF, nest_prior_squashes=True)
 
 
-def test_nested_squash_keeps_a_cross_app_model_move_young(make_migration):
+def test_nested_squash_keeps_a_cross_app_model_move_young(make_migration, monkeypatch):
+    # The planning runs on any Django; only migrating a nested squash needs 6.0.
+    monkeypatch.setattr(planning.django, "VERSION", (6, 0, 0, "final", 0))
     move_out = loading.OpInfo(kind="SeparateDatabaseAndState", moved_out=("thing",))
     move_in = loading.OpInfo(kind="SeparateDatabaseAndState", moved_in=("thing",))
     migs = [
