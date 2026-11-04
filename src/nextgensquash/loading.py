@@ -48,6 +48,10 @@ class OpInfo:
     # state-backed name lands in the squash snapshot, so its raw SQL is never
     # forwarded to schema_addons.
     state_names: tuple[str, ...] = ()
+    # Models a SeparateDatabaseAndState without database operations creates or
+    # deletes in state only: the two halves of a cross-app model move.
+    moved_in: tuple[str, ...] = ()
+    moved_out: tuple[str, ...] = ()
 
 
 @dataclass(frozen=False)
@@ -85,6 +89,12 @@ def _op_state_names(op: Any) -> tuple[str, ...]:
     return (name,) if isinstance(name, str) else ()
 
 
+def _state_only_models(
+    op: migrations.SeparateDatabaseAndState, kind: type[migrations.CreateModel | migrations.DeleteModel]
+) -> tuple[str, ...]:
+    return tuple(o.name.lower() for o in op.state_operations if isinstance(o, kind))
+
+
 def _summarize_op(op: Any) -> OpInfo:
     kind = op.__class__.__name__
     if kind == "RunPython":
@@ -95,7 +105,14 @@ def _summarize_op(op: Any) -> OpInfo:
     if isinstance(op, migrations.SeparateDatabaseAndState):
         inner = [_op_sql_text(o) for o in op.database_operations if isinstance(o, migrations.RunSQL)]
         state_names = tuple(n for o in op.state_operations for n in _op_state_names(o))
-        return OpInfo(kind=kind, sql=" ".join(inner) or None, state_names=state_names)
+        state_only = not op.database_operations
+        return OpInfo(
+            kind=kind,
+            sql=" ".join(inner) or None,
+            state_names=state_names,
+            moved_in=_state_only_models(op, migrations.CreateModel) if state_only else (),
+            moved_out=_state_only_models(op, migrations.DeleteModel) if state_only else (),
+        )
     target = getattr(op, "name", None) or getattr(op, "model_name", None)
     return OpInfo(kind=kind, target=target if isinstance(target, str) else None, state_names=_op_state_names(op))
 

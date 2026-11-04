@@ -416,34 +416,45 @@ class Emitter:
         """Every old migration of this app, plus the transitive members of any
         squash already on disk. A node that a prior squash replaces is not in
         the loader graph, but its name is still recorded on live databases."""
-        out: set[tuple[str, str]] = set()
-        for m in self.squasher.old.values():
-            if m.ref.app != self.app:
-                continue
-            out.add(m.ref.key)
-            out.update(r.key for r in m.replaces)
-        return out
+        own = [m for m in self.squasher.old.values() if m.ref.app == self.app]
+        return {m.ref.key for m in own} | planning.replaced_closure(own, self.squasher.tree.hidden)
 
-    def _replaces(self, emit_stub: bool) -> list[tuple[str, str]]:
-        """Claim every old migration for this app, including the transitive
-        members of any squash already on disk. Install will strip `replaces` from
-        those existing squashes so Django sees them as plain migrations — then
-        our single fold removes them all from the graph cleanly.
-        """
+    def _replaces_exclusions(self, emit_stub: bool) -> set[tuple[str, str]]:
         # Names the stub claims belong to exactly one replacement node.
         excluded = set(self.config.stub_claims.get(self.app, ()))
         if emit_stub:
             # A prior phase's stub has the same name as the stub emitted now.
             # Claiming it would remove the new stub from the graph.
             excluded.add((self.app, self.STUB_NAME))
-        return sorted(self._claimable_keys() - excluded)
+        return excluded
 
-    # The existence guard wrapped around each forwarded FK add, as written below.
+    def folded_keys(self, emit_stub: bool) -> list[tuple[str, str]]:
+        """Every name the initial folds, including the transitive members of any
+        squash already on disk. `retire` needs the full set to delete them all."""
+        return sorted(self._claimable_keys() - self._replaces_exclusions(emit_stub))
+
+    def _replaces(self, emit_stub: bool) -> list[tuple[str, str]]:
+        """The initial's `replaces=` list.
+
+        Flat by default: it claims the members of prior squashes directly, and
+        install strips or deletes those squashes so Django sees one fold. With
+        `nest_prior_squashes` it claims each prior squash by its own name. Django
+        6.0+ resolves the members through it, so a database that stopped inside
+        the prior squash's range falls back to that squash.
+        """
+        if not self.squasher.nest_prior_squashes:
+            return self.folded_keys(emit_stub)
+        own_old = {m.ref.key for m in self.squasher.old.values() if m.ref.app == self.app}
+        return sorted(own_old - self._replaces_exclusions(emit_stub))
+
+    # An existence guard around one FK add: the one written below, or the same
+    # block laid out over several lines in a hand-written migration.
     FK_GUARD_RE = re.compile(
-        r"DO \$\$ BEGIN IF NOT EXISTS \(SELECT 1 FROM pg_constraint WHERE conname = '[^']+'\) THEN\n"
-        r"(.*?);\nEND IF; END \$\$",
-        re.S,
+        r"DO\s+\$\$\s*BEGIN\s+IF\s+NOT\s+EXISTS\s*\(\s*SELECT\s+1\s+FROM\s+pg_constraint\s+"
+        r"WHERE\s+conname\s*=\s*'[^']+'\s*\)\s*THEN\s+(.*?);\s*END\s+IF;\s*END\s*\$\$",
+        re.S | re.I,
     )
+    _VALIDATE_CONSTRAINT_RE = re.compile(r"VALIDATE\s+CONSTRAINT\s+\"?([a-zA-Z0-9_]+)\"?", re.I)
 
     EXTENSION_OP_NAMES: frozenset[str] = frozenset(
         {
@@ -509,6 +520,33 @@ class Emitter:
         {"AddForeignKeyNotValid", "ValidateForeignKey", "ValidateConstraint"}
     )
 
+    def _moved_by_folded_state_move(self, model_name: str, owner_app: str) -> bool:
+        """Whether this app's folded migrations moved the model out in state only
+        and `owner_app`'s folded migrations moved it in. A same-name model in
+        another app without such a pair is an unrelated model."""
+        moved_out = moved_in = False
+        for m in self.squasher.old.values():
+            for op in m.operations:
+                if m.ref.app == self.app and model_name in op.moved_out:
+                    moved_out = True
+                if m.ref.app == owner_app and model_name in op.moved_in:
+                    moved_in = True
+        return moved_out and moved_in
+
+    def _state_table(self, model_name: str) -> str | None:
+        """Table of the model in the squash state, in its declared case: this
+        app's model, or the one app a folded cross-app state move took it to.
+        None when the model is gone, or when no folded move explains a model
+        of that name in another app."""
+        name = model_name.lower()
+        model_state = self.state.models.get((self.app, name))
+        if model_state is None:
+            owners = [ms for (_app, model), ms in self.state.models.items() if model == name]
+            if len(owners) != 1 or not self._moved_by_folded_state_move(name, owners[0].app_label):
+                return None
+            model_state = owners[0]
+        return model_state.options.get("db_table") or f"{model_state.app_label}_{name}"
+
     def _stateless_constraint_ops(self) -> list[Any]:
         out: list[Any] = []
         # Validate ops only make sense for constraints the squash actually
@@ -517,23 +555,46 @@ class Emitter:
         available = set(self._forwarded_fk_constraint_names) | self._final_state_index_names()
         for mig_name, op in self._claimed_ops():
             kind = op.__class__.__name__
+            if kind not in self.STATELESS_CONSTRAINT_OP_NAMES:
+                continue
+            table = self._state_table(op.model_name)
+            # The column check reads the final schema, so it needs the final table name.
+            # A young migration can rename the table after the cutoff.
+            final_table = _model_db_table(self.app, op.model_name) or (table.lower() if table else None)
             if kind == "AddForeignKeyNotValid":
-                if not self._model_has_column(op.model_name, op.column):
+                if final_table is None or op.column not in _managed_table_columns().get(final_table, frozenset()):
                     self.dropped_runsql.append(f"{self.app}.{mig_name} [dead-column]: {op.name}")
                     continue
                 available.add(op.name)
+            elif op.name not in available:
+                self.dropped_runsql.append(f"{self.app}.{mig_name} [unpaired-validate]: {op.name}")
+                continue
+            if _model_db_table(self.app, op.model_name) is not None:
                 out.append(op)
-            elif kind in self.STATELESS_CONSTRAINT_OP_NAMES:
-                if op.name in available:
-                    out.append(op)
-                else:
-                    self.dropped_runsql.append(f"{self.app}.{mig_name} [unpaired-validate]: {op.name}")
+                continue
+            if table is None:
+                self.dropped_runsql.append(f"{self.app}.{mig_name} [dead-model]: {op.name}")
+                continue
+            out.append(self._raw_sql_op(op, table))
         return out
 
-    def _model_has_column(self, model_name: str, column: str) -> bool:
-        """Whether this app's model still has `column` in the final state."""
-        table = _model_db_table(self.app, model_name)
-        return table is not None and column in _managed_table_columns().get(table, frozenset())
+    def _raw_sql_op(self, op: Any, table: str) -> Any:
+        """The op as raw SQL on `table`. The schema_addons tail runs at the
+        app's leaf, where a model that a later migration moved to another app
+        is gone from this app's state, so the helper op could not resolve it."""
+        if op.__class__.__name__ == "AddForeignKeyNotValid":
+            add = (
+                f'ALTER TABLE "{table}" ADD CONSTRAINT "{op.name}" FOREIGN KEY ("{op.column}") '
+                f'REFERENCES "{op.to_table}" ("{op.to_column}") DEFERRABLE INITIALLY DEFERRED NOT VALID'
+            )
+            sql = (
+                "DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_constraint "
+                f"WHERE conname = '{op.name}') THEN\n{add};\nEND IF; END $$;"
+            )
+        else:
+            # Validating an already valid constraint is a no-op.
+            sql = f'ALTER TABLE "{table}" VALIDATE CONSTRAINT "{op.name}";'
+        return dj_migrations.RunSQL(sql=sql, reverse_sql=dj_migrations.RunSQL.noop)
 
     @staticmethod
     def _runsql_statements(op: Any) -> list[tuple[str, Any | None]]:
@@ -682,6 +743,134 @@ class Emitter:
             for stmt, params in Emitter._runsql_statements(op)
         ]
 
+    _STORAGE_PARAMS_RE = re.compile(
+        r"^ALTER\s+TABLE\s+(?:ONLY\s+)?\"?([a-zA-Z0-9_]+)\"?\s+(?:SET|RESET)\s*\(", re.IGNORECASE
+    )
+
+    @classmethod
+    def _storage_param_statements(cls, sql_text: str, managed_tables: frozenset[str]) -> list[str]:
+        """Return the `ALTER TABLE ... SET (...)` and `RESET (...)` statements on tables the squash creates.
+
+        Table storage parameters, such as autovacuum tuning, live outside the model state,
+        so CreateModel cannot reproduce them.
+        """
+        out = []
+        for stmt in sql_text.split(";"):
+            stmt = stmt.strip()
+            match = cls._STORAGE_PARAMS_RE.match(stmt)
+            if match and match.group(1).lower() in managed_tables:
+                out.append(stmt)
+        return out
+
+    # Unanchored: the planner joins a RunSQL list with spaces, not semicolons.
+    _STORAGE_PARAM_KEYS_RE = re.compile(
+        r"ALTER\s+TABLE\s+(?:ONLY\s+)?\"?([a-zA-Z0-9_]+)\"?\s+(?:SET|RESET)\s*\(([^)]*)\)", re.IGNORECASE
+    )
+    # The lock_timeout set and reset around forwarded storage DDL. It is carried, not dropped.
+    _SESSION_TIMEOUT_RE = re.compile(r"^(?:SET|RESET)\s+(?:LOCAL\s+|SESSION\s+)?lock_timeout\b", re.IGNORECASE)
+    _LOCK_TIMEOUT_RE = re.compile(r"^SET\s+(?:LOCAL\s+|SESSION\s+)?lock_timeout\s*(?:=|TO)\s*(.+)$", re.IGNORECASE)
+
+    @classmethod
+    def _storage_param_keys(cls, sql: str) -> set[tuple[str, str]]:
+        """The lowercase `(table, parameter)` pairs that storage statements in `sql` set or reset."""
+        out: set[tuple[str, str]] = set()
+        for table, inside in cls._STORAGE_PARAM_KEYS_RE.findall(sql):
+            for part in inside.split(","):
+                if part.strip():
+                    out.add((table.lower(), part.split("=", 1)[0].strip().lower()))
+        return out
+
+    def _young_storage_param_keys(self) -> set[tuple[str, str]]:
+        """Storage parameters that young migrations set or reset. schema_addons runs after
+        the young chain, so a forwarded older value for one of them would win."""
+        out: set[tuple[str, str]] = set()
+        for m in self.squasher.young.values():
+            for op in m.operations:
+                out |= self._storage_param_keys(op.sql or "")
+        return out
+
+    _STORAGE_PARAMS_PARTS_RE = re.compile(
+        r"^(ALTER\s+TABLE\s+(?:ONLY\s+)?\"?([a-zA-Z0-9_]+)\"?\s+(?:SET|RESET)\s*\()([^)]*)(\).*)$",
+        re.IGNORECASE | re.DOTALL,
+    )
+
+    @classmethod
+    def _without_young_params(cls, stmt: str, young_keys: set[tuple[str, str]]) -> tuple[str | None, list[str]]:
+        """The storage statement without the parameters young migrations change, and the removed names.
+
+        The statement is None when every parameter is removed, and unchanged when none is.
+        """
+        match = cls._STORAGE_PARAMS_PARTS_RE.match(stmt)
+        if match is None:
+            return stmt, []
+        head, table, inside, tail = match.groups()
+        kept: list[str] = []
+        overridden: list[str] = []
+        for part in inside.split(","):
+            if not part.strip():
+                continue
+            name = part.split("=", 1)[0].strip().lower()
+            if (table.lower(), name) in young_keys:
+                overridden.append(name)
+            else:
+                kept.append(part.strip())
+        if not overridden:
+            return stmt, []
+        if not kept:
+            return None, overridden
+        return f"{head}{', '.join(kept)}{tail}", overridden
+
+    def _storage_params_op(
+        self, mig_name: str, op: Any, statements: list[str], young_keys: set[tuple[str, str]]
+    ) -> Any | None:
+        """The forwarded storage statements as one RunSQL, or None when nothing is left to forward.
+
+        Parameters that young migrations change are left out. The original
+        `lock_timeout` is kept as a session setting, because the non-atomic
+        addons file gives `SET LOCAL` no transaction to live in.
+        """
+        if any(params is not None for _stmt, params in self._runsql_statements(op)):
+            self.dropped_runsql.append(f"{self.app}.{mig_name} [parameterized]: {statements[0][:160]}")
+            return None
+        forwarded = []
+        for stmt in statements:
+            kept_stmt, overridden = self._without_young_params(stmt, young_keys)
+            if overridden:
+                self.dropped_runsql.append(
+                    f"{self.app}.{mig_name} [young-override]: {', '.join(overridden)} in {stmt[:160]}"
+                )
+            if kept_stmt is not None:
+                forwarded.append(kept_stmt)
+        if not forwarded:
+            return None
+        sql = ";\n".join(forwarded) + ";"
+        lock_timeout = None
+        for stmt in self._runsql_text(op).split(";"):
+            match = self._LOCK_TIMEOUT_RE.match(stmt.strip())
+            if match is not None:
+                lock_timeout = match.group(1)
+        if lock_timeout is not None:
+            sql = f"SET lock_timeout = {lock_timeout};\n{sql}\nRESET lock_timeout;"
+        # SET and RESET of a storage parameter give the same result on every run,
+        # so they need no existence guard. Noop reverse, as for the forwarded FK adds.
+        return dj_migrations.RunSQL(sql=sql, reverse_sql=dj_migrations.RunSQL.noop, hints=op.hints)
+
+    _STANDALONE_VALIDATE_RE = re.compile(
+        r"^ALTER\s+TABLE\s+(?:ONLY\s+)?\"?[a-zA-Z0-9_]+\"?\s+VALIDATE\s+CONSTRAINT\s+\"?([a-zA-Z0-9_]+)\"?$",
+        re.IGNORECASE,
+    )
+
+    def _validates_forwarded_fks_only(self, sql_text: str) -> bool:
+        """Whether every statement validates a foreign key that an earlier forwarded add creates."""
+        statements = [s.strip() for s in sql_text.split(";") if s.strip()]
+        if not statements:
+            return False
+        for stmt in statements:
+            match = self._STANDALONE_VALIDATE_RE.match(stmt)
+            if match is None or match.group(1) not in self._forwarded_fk_constraint_names:
+                return False
+        return True
+
     def _collect_index_runsql_ops(self) -> list[Any]:
         """Return RunSQL ops from claimed migrations that CREATE indexes the
         final-state Meta doesn't already produce. Apply Create/Drop pair
@@ -692,6 +881,7 @@ class Emitter:
         meta_index_names = self._final_state_index_names()
         managed_tables = _managed_table_names()
         dropped_columns = self._dropped_columns()
+        young_storage_keys = self._young_storage_param_keys()
 
         kept: list[Any | None] = []
         create_position: dict[str, int] = {}
@@ -748,6 +938,11 @@ class Emitter:
                             "DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_constraint "
                             f"WHERE conname = '{cname}') THEN\n{stmt};\nEND IF; END $$"
                         )
+                    elif (vmatch := self._VALIDATE_CONSTRAINT_RE.search(stmt)) and (
+                        vmatch.group(1) in self._forwarded_fk_constraint_names
+                    ):
+                        # Validating an already valid constraint is a no-op, so it needs no guard.
+                        forwarded_stmts.append(stmt)
                     else:
                         self.dropped_runsql.append(f"{self.app}.{mig_name} [table-ddl]: {stmt[:160]}")
                 if forwarded_stmts:
@@ -770,6 +965,20 @@ class Emitter:
                 prior = create_position.pop(consumed, None)
                 if prior is not None:
                     kept[prior] = None  # the constraint owns that index now
+            storage_stmts = self._storage_param_statements(sql_text, managed_tables)
+            if storage_stmts and "CREATE TABLE" not in sql_upper and "DROP TABLE" not in sql_upper:
+                storage_op = self._storage_params_op(mig_name, op, storage_stmts, young_storage_keys)
+                if storage_op is not None:
+                    kept.append(storage_op)
+                for stmt in sql_text.split(";"):
+                    stmt = stmt.strip()
+                    if stmt and stmt not in storage_stmts and not self._SESSION_TIMEOUT_RE.match(stmt):
+                        self.dropped_runsql.append(f"{self.app}.{mig_name} [table-ddl]: {stmt[:160]}")
+                continue
+            if self._validates_forwarded_fks_only(sql_text):
+                # A prior squash's addons hold a moved model's FK validation as its own RunSQL.
+                kept.append(dj_migrations.RunSQL(sql=sql_text.strip(), reverse_sql=dj_migrations.RunSQL.noop))
+                continue
             if any(kw in sql_upper for kw in ("CREATE TABLE", "ALTER TABLE", "DROP TABLE")):
                 self.dropped_runsql.append(f"{self.app}.{mig_name} [table-ddl]: {sql_text[:160]}")
                 continue
@@ -883,6 +1092,15 @@ class Emitter:
         return None
 
     @staticmethod
+    def _flatten_wrapped_ops(ops: list[Any]) -> Iterator[Any]:
+        """The ops with each SeparateDatabaseAndState replaced by its state and database ops."""
+        for op in ops:
+            if isinstance(op, dj_migrations.SeparateDatabaseAndState):
+                yield from Emitter._flatten_wrapped_ops(list(op.state_operations) + list(op.database_operations))
+            else:
+                yield op
+
+    @staticmethod
     def check_young_against_deferred(
         squasher: planning.Squasher, cycle_breaker: cyclebreak.CycleBreaker, loader: MigrationLoader
     ) -> None:
@@ -903,7 +1121,7 @@ class Emitter:
             node = loader.graph.nodes.get(m.ref.key)
             if node is None:
                 continue
-            for op in node.operations:
+            for op in Emitter._flatten_wrapped_ops(list(node.operations)):
                 violation = Emitter._deferred_violation(op, deferred)
                 if violation is not None:
                     violations.append(f"{m.ref}: {violation}")

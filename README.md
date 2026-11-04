@@ -60,6 +60,12 @@ NEXTGENSQUASH = {
     # friends. Defaults to "nextgensquash.operations"; point it at an in-project
     # copy of that module to avoid a runtime dependency on this package.
     "OPERATIONS_MODULE": "myapp.migration_helpers.squash_operations",
+
+    # JSON file under BASE_DIR that lists every dependency entry an install
+    # removed to break a cycle, across all squash generations. Install merges
+    # each run into it. Read it from a migrate gate to refuse a database that
+    # would fall back to files that lost an entry. Unset skips the file.
+    "REMOVED_DEPENDENCIES_FILE": "myapp/migration_helpers/removed_migration_dependencies.json",
 }
 ```
 
@@ -91,6 +97,10 @@ python -m nextgensquash retire --input-dir /tmp/squash
 The console script `nextgensquash` is equivalent to `python -m nextgensquash`.
 
 Two flags shape the plan. `--min-young N` (default 3) keeps at least N live migrations per app after the squash, moving the newest pre-cutoff migrations to young where the date alone leaves fewer. Without it the squash becomes a dormant app's tip and claims names that in-flight branches still reference. `--no-include-prior-squashes` ignores output from earlier phases instead of folding it into the new one.
+
+`--nest-prior-squashes` (Django 6.0 or later) keeps the earlier phases on disk. Each new initial lists the prior squash files by their own names in `replaces=`, and Django resolves their members recursively, at any depth. A database that stopped inside the prior squash's range then falls back to that squash instead of to its original files. Install leaves those files in place. The emitter still walks every level of nesting, so the cycle breaker and the retire manifest see the files behind a squash that is itself behind a squash.
+
+The fallback has one limit. Install removes cross-app dependency entries from files that stay on disk, so a database that replays those files no longer has that ordering. `REMOVED_DEPENDENCIES_FILE` keeps the full list, so a migrate gate can refuse such a database before it runs anything.
 
 The lifecycle is `emit` plus `install` on a branch, review the diff, merge. The squash then ships as a normal change: fresh databases build from it, existing ones stamp it on their next migrate. Only once it has been applied in every environment that depends on the repo do you run `retire`, which rewrites remaining dependencies to point at the squash that replaced each folded name (the app's initial, or the stub for the root node a stub claims), empties `replaces=[]`, moves the `run_before` entries of the replaced files onto the initial, and deletes the replaced files from disk. That is Django's own advice, and doing it early strands any database that has not caught up.
 

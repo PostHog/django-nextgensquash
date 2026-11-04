@@ -68,10 +68,12 @@ def test_idempotent_index_sql_keeps_list_elements_and_their_params():
     ]
 
 
-def _forwarder(monkeypatch, claimed: list[tuple[str, migrations.RunSQL]]) -> Emitter:
+def _forwarder(monkeypatch, claimed: list[tuple[str, migrations.RunSQL]], young_sql: str | None = None) -> Emitter:
     # Enough of an Emitter for `_collect_index_runsql_ops`; no loader, no Django app registry.
     emitter = object.__new__(Emitter)
     emitter.app = "app"
+    young = SimpleNamespace(operations=[loading.OpInfo(kind="RunSQL", sql=young_sql)])
+    emitter.squasher = SimpleNamespace(young={("app", "0200_young"): young})
     emitter.dropped_runsql = []
     emitter._forwarded_fk_constraint_names = set()
     monkeypatch.setattr(emitter, "_claimed_ops", lambda: iter(claimed))
@@ -189,18 +191,30 @@ def test_run_before_is_written_only_once_the_squash_replaces_nothing(tmp_path, r
     assert ('("oauth2_provider", "0001_initial")' in text) is writes_run_before
 
 
-def _restack_emitter(make_migration) -> Emitter:
+def _restack_emitter(make_migration, nest_prior_squashes: bool = False) -> Emitter:
     # Phase N over phase N-1: the old stub already claims the root that the config names.
+    # Phase N-1 itself nests phase N-2, whose file and its member stay on disk.
     hidden_root = loading.MigrationRef(app="app", name="0001_initial_squashed_0010")
+    grandparent = make_migration(
+        "app", "0001_squash_2025_06_01_initial", replaces=[loading.MigrationRef("app", "0005_deep")]
+    )
     old = [
         make_migration("app", "0000_squash_stub", replaces=[hidden_root]),
-        make_migration("app", "0001_squash_2026_01_01_initial", replaces=[loading.MigrationRef("app", "0011_x")]),
+        make_migration(
+            "app",
+            "0001_squash_2026_01_01_initial",
+            replaces=[grandparent.ref, loading.MigrationRef("app", "0011_x")],
+        ),
         make_migration("app", "0012_y"),
     ]
     emitter = object.__new__(Emitter)
     emitter.app = "app"
     emitter.config = SimpleNamespace(stub_claims={"app": [hidden_root.key]})
-    emitter.squasher = SimpleNamespace(old={m.ref.key: m for m in old})
+    emitter.squasher = SimpleNamespace(
+        old={m.ref.key: m for m in old},
+        nest_prior_squashes=nest_prior_squashes,
+        tree=SimpleNamespace(hidden={grandparent.ref.key: grandparent}),
+    )
     return emitter
 
 
@@ -223,6 +237,108 @@ def test_initial_claims_the_prior_stub_only_without_a_new_stub(make_migration, e
     assert ("app", "0011_x") in replaces
 
 
+@pytest.mark.parametrize(
+    ("nest_prior_squashes", "claims_prior_initial", "claims_its_member"),
+    [
+        (False, True, True),  # flat: the members are claimed directly and install deletes the prior squash
+        (True, True, False),  # nested: Django resolves the members through the kept prior squash
+    ],
+)
+def test_initial_claims_prior_squash_members_only_when_flat(
+    make_migration, nest_prior_squashes, claims_prior_initial, claims_its_member
+):
+    emitter = _restack_emitter(make_migration, nest_prior_squashes)
+
+    replaces = emitter._replaces(emit_stub=True)
+
+    assert (("app", "0001_squash_2026_01_01_initial") in replaces) is claims_prior_initial
+    assert (("app", "0011_x") in replaces) is claims_its_member
+    assert (("app", "0005_deep") in replaces) is claims_its_member
+    # retire deletes every folded file, so the manifest set stays flat either way.
+    assert {("app", "0011_x"), ("app", "0005_deep")} <= set(emitter.folded_keys(emit_stub=True))
+
+
+def _storage_sql(params: str) -> list[str]:
+    return [f"SET lock_timeout = '5s';\nALTER TABLE app_thing SET ({params});\nRESET lock_timeout;"]
+
+
+@pytest.mark.parametrize(
+    ("table", "young_sql", "forwarded"),
+    [
+        ("app_thing", None, _storage_sql("autovacuum_vacuum_scale_factor = 0.02, fillfactor = 70")),
+        ("app_gone", None, []),  # a table the squash does not create
+        # schema_addons runs after the young chain, so an old value would overwrite the young change.
+        ("app_thing", "ALTER TABLE app_thing RESET (autovacuum_vacuum_scale_factor)", _storage_sql("fillfactor = 70")),
+        ("app_thing", "ALTER TABLE app_thing SET (fillfactor = 80, autovacuum_vacuum_scale_factor = 0.1)", []),
+        (
+            "app_thing",
+            "ALTER TABLE app_other SET (fillfactor = 80)",
+            _storage_sql("autovacuum_vacuum_scale_factor = 0.02, fillfactor = 70"),
+        ),
+    ],
+)
+def test_storage_parameters_are_forwarded_for_tables_the_squash_creates(monkeypatch, table, young_sql, forwarded):
+    sql = f"SET LOCAL lock_timeout = '5s';\nALTER TABLE {table} SET (autovacuum_vacuum_scale_factor = 0.02, fillfactor = 70)"
+    hints = {"model_name": "thing"}
+
+    ops = _forwarder(
+        monkeypatch, [("0178", migrations.RunSQL(sql, hints=hints))], young_sql
+    )._collect_index_runsql_ops()
+
+    assert [op.sql for op in ops] == forwarded
+    # A router may pick the database from the hints.
+    assert all(op.hints == hints for op in ops)
+
+
+def test_other_statements_beside_storage_parameters_are_logged_as_dropped(monkeypatch):
+    sql = "SET LOCAL lock_timeout = '5s';\nALTER TABLE app_thing ADD COLUMN c integer;\nALTER TABLE app_thing SET (fillfactor = 70)"
+    emitter = _forwarder(monkeypatch, [("0178", migrations.RunSQL(sql))])
+
+    [op] = emitter._collect_index_runsql_ops()
+
+    assert "ADD COLUMN" not in op.sql
+    assert emitter.dropped_runsql == ["app.0178 [table-ddl]: ALTER TABLE app_thing ADD COLUMN c integer"]
+
+
+def test_validate_on_a_model_with_no_table_left_is_dropped(monkeypatch):
+    emitter = object.__new__(Emitter)
+    emitter.app = "app"
+    emitter.dropped_runsql = []
+    emitter._forwarded_fk_constraint_names = set()
+    monkeypatch.setattr(emitter, "_claimed_ops", lambda: iter([("0013", ValidateForeignKey("thing_team_fk"))]))
+    monkeypatch.setattr(emitter, "_final_state_index_names", lambda: {"thing_team_fk"})
+    monkeypatch.setattr(emitter, "_state_table", lambda model_name: None)
+    monkeypatch.setattr("nextgensquash.emit._model_db_table", lambda app, model: None)
+
+    assert emitter._stateless_constraint_ops() == []
+    assert emitter.dropped_runsql == ["app.0013 [dead-model]: thing_team_fk"]
+
+
+def test_parameterized_storage_parameters_are_left_out(monkeypatch):
+    op = migrations.RunSQL([("ALTER TABLE app_thing SET (fillfactor = %s)", [70])])
+    emitter = _forwarder(monkeypatch, [("0178", op)])
+
+    assert emitter._collect_index_runsql_ops() == []
+    assert emitter.dropped_runsql == ["app.0178 [parameterized]: ALTER TABLE app_thing SET (fillfactor = %s)"]
+
+
+def test_moved_model_fk_validation_from_a_prior_squash_is_forwarded_with_its_add(monkeypatch):
+    add = 'ALTER TABLE "app_thing" ADD CONSTRAINT "thing_team_fk" FOREIGN KEY ("a") REFERENCES "posthog_team" ("id")'
+    guarded = f"DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'thing_team_fk') THEN\n{add};\nEND IF; END $$;"
+    claimed = [
+        ("0045_squash_2026_01_01_schema_addons", migrations.RunSQL(guarded)),
+        (
+            "0045_squash_2026_01_01_schema_addons",
+            migrations.RunSQL('ALTER TABLE "app_thing" VALIDATE CONSTRAINT "thing_team_fk";'),
+        ),
+        ("0046", migrations.RunSQL('ALTER TABLE "app_thing" VALIDATE CONSTRAINT "unknown_fk";')),
+    ]
+
+    ops = _forwarder(monkeypatch, claimed)._collect_index_runsql_ops()
+
+    assert [op.sql for op in ops] == [guarded, 'ALTER TABLE "app_thing" VALIDATE CONSTRAINT "thing_team_fk";']
+
+
 def test_forwarded_fk_add_from_a_prior_squash_keeps_one_guard(monkeypatch):
     add = "ALTER TABLE app_thing ADD CONSTRAINT thing_owner_fk FOREIGN KEY (a, b) REFERENCES app_owner (a, b) NOT VALID"
     guarded = (
@@ -234,6 +350,26 @@ def test_forwarded_fk_add_from_a_prior_squash_keeps_one_guard(monkeypatch):
     )._collect_index_runsql_ops()
 
     assert [op.sql for op in ops] == [guarded]
+
+
+def test_hand_written_guarded_fk_add_is_forwarded_with_its_validate(monkeypatch):
+    sql = """
+    DO $$ BEGIN
+      IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint WHERE conname = 'part_matches_parent'
+      ) THEN
+        ALTER TABLE app_thing ADD CONSTRAINT part_matches_parent FOREIGN KEY (a, b) REFERENCES app_owner (a, b) NOT VALID;
+      END IF;
+    END $$;
+    ALTER TABLE app_thing VALIDATE CONSTRAINT part_matches_parent;
+    """
+    emitter = _forwarder(monkeypatch, [("0070", migrations.RunSQL(sql))])
+
+    [op] = emitter._collect_index_runsql_ops()
+
+    assert "ADD CONSTRAINT part_matches_parent FOREIGN KEY (a, b)" in op.sql
+    assert op.sql.rstrip(";").endswith("ALTER TABLE app_thing VALIDATE CONSTRAINT part_matches_parent")
+    assert emitter.dropped_runsql == []
 
 
 @pytest.mark.parametrize(
@@ -261,8 +397,8 @@ class AddForeignKeyNotValid:
 
 
 class ValidateForeignKey:
-    def __init__(self, name: str):
-        self.name = name
+    def __init__(self, name: str, model_name: str = "thing"):
+        self.name, self.model_name = name, model_name
 
 
 def test_fk_helper_on_a_dropped_column_is_left_out_with_its_validate(monkeypatch):
@@ -277,9 +413,40 @@ def test_fk_helper_on_a_dropped_column_is_left_out_with_its_validate(monkeypatch
     ]
     monkeypatch.setattr(emitter, "_claimed_ops", lambda: iter(claimed))
     monkeypatch.setattr(emitter, "_final_state_index_names", lambda: set())
-    monkeypatch.setattr(emitter, "_model_has_column", lambda model_name, column: column == "owner_id")
+    monkeypatch.setattr(emitter, "_state_table", lambda model_name: "app_thing")
+    monkeypatch.setattr("nextgensquash.emit._managed_table_columns", lambda: {"app_thing": frozenset({"owner_id"})})
+    monkeypatch.setattr("nextgensquash.emit._model_db_table", lambda app, model: "app_thing")
 
     assert [op.name for op in emitter._stateless_constraint_ops()] == ["thing_owner_fk"]
+
+
+@pytest.mark.parametrize(
+    ("final_table", "forwards_raw_sql"),
+    [
+        ("app_thing", False),  # the helper op resolves the model in this app's state at the tail
+        (None, True),  # a later migration moved the model away, so only raw SQL can reach the table
+        ("app_renamed", False),  # a young migration renamed the table; the column check reads the final name
+    ],
+)
+def test_fk_helper_on_a_model_moved_away_is_forwarded_as_raw_sql(monkeypatch, final_table, forwards_raw_sql):
+    emitter = object.__new__(Emitter)
+    emitter.app = "app"
+    emitter.dropped_runsql = []
+    emitter._forwarded_fk_constraint_names = set()
+    add = AddForeignKeyNotValid("thing_team_fk", "thing", "team_id")
+    add.to_table, add.to_column = "posthog_team", "id"
+    monkeypatch.setattr(emitter, "_claimed_ops", lambda: iter([("0013", add)]))
+    monkeypatch.setattr(emitter, "_final_state_index_names", lambda: set())
+    monkeypatch.setattr(emitter, "_state_table", lambda model_name: "app_thing")
+    columns = {final_table or "app_thing": frozenset({"team_id"})}
+    monkeypatch.setattr("nextgensquash.emit._managed_table_columns", lambda: columns)
+    monkeypatch.setattr("nextgensquash.emit._model_db_table", lambda app, model: final_table)
+
+    [op] = emitter._stateless_constraint_ops()
+
+    assert isinstance(op, migrations.RunSQL) is forwards_raw_sql
+    if forwards_raw_sql:
+        assert 'ALTER TABLE "app_thing" ADD CONSTRAINT "thing_team_fk" FOREIGN KEY ("team_id")' in op.sql
 
 
 def test_expression_index_on_a_raw_dropped_column_is_left_out(monkeypatch):
@@ -339,3 +506,49 @@ def test_run_before_of_a_file_behind_a_prior_squash_is_carried(make_migration):
     )
 
     assert emitter._carried_run_before() == [("oauth2_provider", "0001_initial")]
+
+
+def _model_state(app_label: str, db_table: str | None = None) -> SimpleNamespace:
+    return SimpleNamespace(app_label=app_label, options={"db_table": db_table} if db_table else {})
+
+
+@pytest.mark.parametrize(
+    ("state_models", "old_ops", "expected"),
+    [
+        # Quoted SQL is case-sensitive, so the declared case must survive.
+        ({("app", "thing"): _model_state("app", "LegacyThing")}, {}, "LegacyThing"),
+        (
+            {("dest", "thing"): _model_state("dest")},
+            {
+                "app": loading.OpInfo(kind="SeparateDatabaseAndState", moved_out=("thing",)),
+                "dest": loading.OpInfo(kind="SeparateDatabaseAndState", moved_in=("thing",)),
+            },
+            "dest_thing",
+        ),
+        # The model was deleted; the same-name model in another app is unrelated.
+        (
+            {("other", "thing"): _model_state("other")},
+            {"app": loading.OpInfo(kind="DeleteModel", target="thing")},
+            None,
+        ),
+    ],
+)
+def test_state_table_follows_only_a_folded_move_and_keeps_case(make_migration, state_models, old_ops, expected):
+    emitter = object.__new__(Emitter)
+    emitter.app = "app"
+    emitter.state = SimpleNamespace(models=state_models)
+    old = [make_migration(app, "0005_x", operations=[op]) for app, op in old_ops.items()]
+    emitter.squasher = SimpleNamespace(old={m.ref.key: m for m in old})
+
+    assert emitter._state_table("Thing") == expected
+
+
+def test_young_state_only_delete_of_a_model_with_a_deferred_fk_is_refused(make_migration):
+    move_out = migrations.SeparateDatabaseAndState(state_operations=[migrations.DeleteModel(name="Thing")])
+    young = make_migration("app", "0050_move_thing_out")
+    squasher = SimpleNamespace(young={young.ref.key: young})
+    breaker = SimpleNamespace(deferred_field_keys_for_app=lambda app: DEFERRED)
+    loader = SimpleNamespace(graph=SimpleNamespace(nodes={young.ref.key: SimpleNamespace(operations=[move_out])}))
+
+    with pytest.raises(RuntimeError, match="DeleteModel thing"):
+        Emitter.check_young_against_deferred(squasher, breaker, loader)
