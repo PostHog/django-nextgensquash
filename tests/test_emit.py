@@ -68,10 +68,12 @@ def test_idempotent_index_sql_keeps_list_elements_and_their_params():
     ]
 
 
-def _forwarder(monkeypatch, claimed: list[tuple[str, migrations.RunSQL]]) -> Emitter:
+def _forwarder(monkeypatch, claimed: list[tuple[str, migrations.RunSQL]], young_sql: str | None = None) -> Emitter:
     # Enough of an Emitter for `_collect_index_runsql_ops`; no loader, no Django app registry.
     emitter = object.__new__(Emitter)
     emitter.app = "app"
+    young = SimpleNamespace(operations=[loading.OpInfo(kind="RunSQL", sql=young_sql)])
+    emitter.squasher = SimpleNamespace(young={("app", "0200_young"): young})
     emitter.dropped_runsql = []
     emitter._forwarded_fk_constraint_names = set()
     monkeypatch.setattr(emitter, "_claimed_ops", lambda: iter(claimed))
@@ -257,18 +259,60 @@ def test_initial_claims_prior_squash_members_only_when_flat(
 
 
 @pytest.mark.parametrize(
-    ("table", "forwarded"),
+    ("table", "young_sql", "forwarded"),
     [
-        ("app_thing", ["ALTER TABLE app_thing SET (autovacuum_vacuum_scale_factor = 0.02);"]),
-        ("app_gone", []),  # a table the squash does not create
+        (
+            "app_thing",
+            None,
+            [
+                "SET lock_timeout = '5s';\nALTER TABLE app_thing SET (autovacuum_vacuum_scale_factor = 0.02);\n"
+                "RESET lock_timeout;"
+            ],
+        ),
+        ("app_gone", None, []),  # a table the squash does not create
+        # schema_addons runs after the young chain, so the old value would overwrite the young reset.
+        ("app_thing", "ALTER TABLE app_thing RESET (autovacuum_vacuum_scale_factor)", []),
+        (
+            "app_thing",
+            "ALTER TABLE app_thing SET (fillfactor = 80)",
+            [
+                "SET lock_timeout = '5s';\nALTER TABLE app_thing SET (autovacuum_vacuum_scale_factor = 0.02);\n"
+                "RESET lock_timeout;"
+            ],
+        ),
     ],
 )
-def test_storage_parameters_are_forwarded_for_tables_the_squash_creates(monkeypatch, table, forwarded):
+def test_storage_parameters_are_forwarded_for_tables_the_squash_creates(monkeypatch, table, young_sql, forwarded):
     sql = f"SET LOCAL lock_timeout = '5s';\nALTER TABLE {table} SET (autovacuum_vacuum_scale_factor = 0.02)"
 
-    ops = _forwarder(monkeypatch, [("0178", migrations.RunSQL(sql))])._collect_index_runsql_ops()
+    ops = _forwarder(monkeypatch, [("0178", migrations.RunSQL(sql))], young_sql)._collect_index_runsql_ops()
 
     assert [op.sql for op in ops] == forwarded
+
+
+def test_parameterized_storage_parameters_are_left_out(monkeypatch):
+    op = migrations.RunSQL([("ALTER TABLE app_thing SET (fillfactor = %s)", [70])])
+    emitter = _forwarder(monkeypatch, [("0178", op)])
+
+    assert emitter._collect_index_runsql_ops() == []
+    assert emitter.dropped_runsql == ["app.0178 [parameterized]: ALTER TABLE app_thing SET (fillfactor = %s)"]
+
+
+def test_moved_model_fk_validation_from_a_prior_squash_is_forwarded_with_its_add(monkeypatch):
+    add = 'ALTER TABLE "app_thing" ADD CONSTRAINT "thing_team_fk" FOREIGN KEY ("a") REFERENCES "posthog_team" ("id")'
+    guarded = f"DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'thing_team_fk') THEN\n{add};\nEND IF; END $$;"
+    claimed = [
+        ("0045_squash_2026_01_01_schema_addons", migrations.RunSQL(guarded)),
+        (
+            "0045_squash_2026_01_01_schema_addons",
+            migrations.RunSQL('ALTER TABLE "app_thing" VALIDATE CONSTRAINT "thing_team_fk";'),
+        ),
+        ("0046", migrations.RunSQL('ALTER TABLE "app_thing" VALIDATE CONSTRAINT "unknown_fk";')),
+    ]
+
+    ops = _forwarder(monkeypatch, claimed)._collect_index_runsql_ops()
+
+    assert [op.sql for op in ops] == [guarded, 'ALTER TABLE "app_thing" VALIDATE CONSTRAINT "thing_team_fk";']
 
 
 def test_forwarded_fk_add_from_a_prior_squash_keeps_one_guard(monkeypatch):
@@ -438,3 +482,49 @@ def test_run_before_of_a_file_behind_a_prior_squash_is_carried(make_migration):
     )
 
     assert emitter._carried_run_before() == [("oauth2_provider", "0001_initial")]
+
+
+def _model_state(app_label: str, db_table: str | None = None) -> SimpleNamespace:
+    return SimpleNamespace(app_label=app_label, options={"db_table": db_table} if db_table else {})
+
+
+@pytest.mark.parametrize(
+    ("state_models", "old_ops", "expected"),
+    [
+        # Quoted SQL is case-sensitive, so the declared case must survive.
+        ({("app", "thing"): _model_state("app", "LegacyThing")}, {}, "LegacyThing"),
+        (
+            {("dest", "thing"): _model_state("dest")},
+            {
+                "app": loading.OpInfo(kind="SeparateDatabaseAndState", moved_out=("thing",)),
+                "dest": loading.OpInfo(kind="SeparateDatabaseAndState", moved_in=("thing",)),
+            },
+            "dest_thing",
+        ),
+        # The model was deleted; the same-name model in another app is unrelated.
+        (
+            {("other", "thing"): _model_state("other")},
+            {"app": loading.OpInfo(kind="DeleteModel", target="thing")},
+            None,
+        ),
+    ],
+)
+def test_state_table_follows_only_a_folded_move_and_keeps_case(make_migration, state_models, old_ops, expected):
+    emitter = object.__new__(Emitter)
+    emitter.app = "app"
+    emitter.state = SimpleNamespace(models=state_models)
+    old = [make_migration(app, "0005_x", operations=[op]) for app, op in old_ops.items()]
+    emitter.squasher = SimpleNamespace(old={m.ref.key: m for m in old})
+
+    assert emitter._state_table("Thing") == expected
+
+
+def test_young_state_only_delete_of_a_model_with_a_deferred_fk_is_refused(make_migration):
+    move_out = migrations.SeparateDatabaseAndState(state_operations=[migrations.DeleteModel(name="Thing")])
+    young = make_migration("app", "0050_move_thing_out")
+    squasher = SimpleNamespace(young={young.ref.key: young})
+    breaker = SimpleNamespace(deferred_field_keys_for_app=lambda app: DEFERRED)
+    loader = SimpleNamespace(graph=SimpleNamespace(nodes={young.ref.key: SimpleNamespace(operations=[move_out])}))
+
+    with pytest.raises(RuntimeError, match="DeleteModel thing"):
+        Emitter.check_young_against_deferred(squasher, breaker, loader)
