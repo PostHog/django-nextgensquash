@@ -558,8 +558,11 @@ class Emitter:
             if kind not in self.STATELESS_CONSTRAINT_OP_NAMES:
                 continue
             table = self._state_table(op.model_name)
+            # The column check reads the final schema, so it needs the final table name.
+            # A young migration can rename the table after the cutoff.
+            final_table = _model_db_table(self.app, op.model_name) or (table.lower() if table else None)
             if kind == "AddForeignKeyNotValid":
-                if table is None or op.column not in _managed_table_columns().get(table.lower(), frozenset()):
+                if final_table is None or op.column not in _managed_table_columns().get(final_table, frozenset()):
                     self.dropped_runsql.append(f"{self.app}.{mig_name} [dead-column]: {op.name}")
                     continue
                 available.add(op.name)
@@ -763,6 +766,8 @@ class Emitter:
     _STORAGE_PARAM_KEYS_RE = re.compile(
         r"ALTER\s+TABLE\s+(?:ONLY\s+)?\"?([a-zA-Z0-9_]+)\"?\s+(?:SET|RESET)\s*\(([^)]*)\)", re.IGNORECASE
     )
+    # The lock_timeout set and reset around forwarded storage DDL. It is carried, not dropped.
+    _SESSION_TIMEOUT_RE = re.compile(r"^(?:SET|RESET)\s+(?:LOCAL\s+|SESSION\s+)?lock_timeout\b", re.IGNORECASE)
     _LOCK_TIMEOUT_RE = re.compile(r"^SET\s+(?:LOCAL\s+|SESSION\s+)?lock_timeout\s*(?:=|TO)\s*(.+)$", re.IGNORECASE)
 
     @classmethod
@@ -965,6 +970,10 @@ class Emitter:
                 storage_op = self._storage_params_op(mig_name, op, storage_stmts, young_storage_keys)
                 if storage_op is not None:
                     kept.append(storage_op)
+                for stmt in sql_text.split(";"):
+                    stmt = stmt.strip()
+                    if stmt and stmt not in storage_stmts and not self._SESSION_TIMEOUT_RE.match(stmt):
+                        self.dropped_runsql.append(f"{self.app}.{mig_name} [table-ddl]: {stmt[:160]}")
                 continue
             if self._validates_forwarded_fks_only(sql_text):
                 # A prior squash's addons hold a moved model's FK validation as its own RunSQL.

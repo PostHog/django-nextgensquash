@@ -290,6 +290,30 @@ def test_storage_parameters_are_forwarded_for_tables_the_squash_creates(monkeypa
     assert all(op.hints == hints for op in ops)
 
 
+def test_other_statements_beside_storage_parameters_are_logged_as_dropped(monkeypatch):
+    sql = "SET LOCAL lock_timeout = '5s';\nALTER TABLE app_thing ADD COLUMN c integer;\nALTER TABLE app_thing SET (fillfactor = 70)"
+    emitter = _forwarder(monkeypatch, [("0178", migrations.RunSQL(sql))])
+
+    [op] = emitter._collect_index_runsql_ops()
+
+    assert "ADD COLUMN" not in op.sql
+    assert emitter.dropped_runsql == ["app.0178 [table-ddl]: ALTER TABLE app_thing ADD COLUMN c integer"]
+
+
+def test_validate_on_a_model_with_no_table_left_is_dropped(monkeypatch):
+    emitter = object.__new__(Emitter)
+    emitter.app = "app"
+    emitter.dropped_runsql = []
+    emitter._forwarded_fk_constraint_names = set()
+    monkeypatch.setattr(emitter, "_claimed_ops", lambda: iter([("0013", ValidateForeignKey("thing_team_fk"))]))
+    monkeypatch.setattr(emitter, "_final_state_index_names", lambda: {"thing_team_fk"})
+    monkeypatch.setattr(emitter, "_state_table", lambda model_name: None)
+    monkeypatch.setattr("nextgensquash.emit._model_db_table", lambda app, model: None)
+
+    assert emitter._stateless_constraint_ops() == []
+    assert emitter.dropped_runsql == ["app.0013 [dead-model]: thing_team_fk"]
+
+
 def test_parameterized_storage_parameters_are_left_out(monkeypatch):
     op = migrations.RunSQL([("ALTER TABLE app_thing SET (fillfactor = %s)", [70])])
     emitter = _forwarder(monkeypatch, [("0178", op)])
@@ -397,13 +421,14 @@ def test_fk_helper_on_a_dropped_column_is_left_out_with_its_validate(monkeypatch
 
 
 @pytest.mark.parametrize(
-    ("app_model_at_tail", "forwards_raw_sql"),
+    ("final_table", "forwards_raw_sql"),
     [
-        (True, False),  # the helper op resolves the model in this app's state at the tail
-        (False, True),  # a later migration moved the model away, so only raw SQL can reach the table
+        ("app_thing", False),  # the helper op resolves the model in this app's state at the tail
+        (None, True),  # a later migration moved the model away, so only raw SQL can reach the table
+        ("app_renamed", False),  # a young migration renamed the table; the column check reads the final name
     ],
 )
-def test_fk_helper_on_a_model_moved_away_is_forwarded_as_raw_sql(monkeypatch, app_model_at_tail, forwards_raw_sql):
+def test_fk_helper_on_a_model_moved_away_is_forwarded_as_raw_sql(monkeypatch, final_table, forwards_raw_sql):
     emitter = object.__new__(Emitter)
     emitter.app = "app"
     emitter.dropped_runsql = []
@@ -413,10 +438,9 @@ def test_fk_helper_on_a_model_moved_away_is_forwarded_as_raw_sql(monkeypatch, ap
     monkeypatch.setattr(emitter, "_claimed_ops", lambda: iter([("0013", add)]))
     monkeypatch.setattr(emitter, "_final_state_index_names", lambda: set())
     monkeypatch.setattr(emitter, "_state_table", lambda model_name: "app_thing")
-    monkeypatch.setattr("nextgensquash.emit._managed_table_columns", lambda: {"app_thing": frozenset({"team_id"})})
-    monkeypatch.setattr(
-        "nextgensquash.emit._model_db_table", lambda app, model: "app_thing" if app_model_at_tail else None
-    )
+    columns = {final_table or "app_thing": frozenset({"team_id"})}
+    monkeypatch.setattr("nextgensquash.emit._managed_table_columns", lambda: columns)
+    monkeypatch.setattr("nextgensquash.emit._model_db_table", lambda app, model: final_table)
 
     [op] = emitter._stateless_constraint_ops()
 

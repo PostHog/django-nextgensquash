@@ -293,3 +293,31 @@ def test_nested_squash_pairs_renamed_moves_whose_names_collide(make_migration, m
         "src_a.0002_move_thing_out",
         "src_b.0002_move_widget_out",
     ]
+
+
+def test_nested_squash_refuses_a_move_that_a_prior_squash_depends_on(make_migration, monkeypatch):
+    monkeypatch.setattr(planning.django, "VERSION", (6, 0, 0, "final", 0))
+    move_out = make_migration(
+        "src",
+        "0002_move_thing_out",
+        commit_date=OLD_DATE,
+        operations=[loading.OpInfo(kind="SeparateDatabaseAndState", moved_out=("thing",))],
+    )
+    move_in = make_migration(
+        "dest",
+        "0002_move_thing_in",
+        commit_date=OLD_DATE,
+        operations=[loading.OpInfo(kind="SeparateDatabaseAndState", moved_in=("thing",))],
+        dependencies=[move_out.ref],
+    )
+    prior = make_migration(
+        "other",
+        "0001_squash_2025_01_01_initial",
+        commit_date=OLD_DATE,
+        replaces=[loading.MigrationRef("other", "0001_initial")],
+        dependencies=[move_in.ref],
+    )
+    tree = loading.MigrationTree({m.ref.key: m for m in (move_out, move_in, prior)}, Config())
+
+    with pytest.raises(RuntimeError, match="is a prior squash"):
+        planning.Squasher(tree, CUTOFF, min_young=0, nest_prior_squashes=True)
