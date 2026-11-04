@@ -25,15 +25,27 @@ def _read_retire_manifest(output_dir: Path) -> dict[str, Any]:
     return json.loads(manifest_path.read_text())
 
 
-def _record_removed_dependencies(path: Path, removed: list[CycleEdge], cutoff: str) -> None:
-    """Merge this install's removed entries into the cumulative list at `path`.
+def _read_removed_dependencies(path: Path) -> list[dict[str, Any]]:
+    """The entries already listed at `path`. Install reads them before it edits
+    any migration, so a broken file stops it while the removals can still be redone."""
+    if not path.exists():
+        return []
+    try:
+        return list(json.loads(path.read_text())["removed"])
+    except (ValueError, KeyError, TypeError) as exc:
+        raise RuntimeError(f"cannot read the removed dependencies list at {path}: {exc!r}; fix it first") from exc
+
+
+def _record_removed_dependencies(
+    path: Path, existing: list[dict[str, Any]], removed: list[CycleEdge], cutoff: str
+) -> None:
+    """Merge this install's removed entries into the `existing` cumulative list and write it to `path`.
 
     `file` is the migration that lost the entry and `entry` is the reference it
     lost from its `attribute` list. For `dependencies` the file is the dependent
     side; for `run_before` the entry is. An entry already listed keeps the cutoff
     of the install that first removed it.
     """
-    existing = json.loads(path.read_text())["removed"] if path.exists() else []
     seen = {(tuple(e["file"]), tuple(e["entry"]), e["attribute"]) for e in existing}
     merged = list(existing)
     for fa, fn, ta, tn, attr in removed:
@@ -55,6 +67,9 @@ def _run_install(args: argparse.Namespace) -> None:
     """
     output_dir = args.input_dir
     retire_manifest = _read_retire_manifest(output_dir)
+    removed_file = Config.from_settings().removed_dependencies_file
+    removed_path = project_root() / removed_file if removed_file else None
+    removed_ledger = _read_removed_dependencies(removed_path) if removed_path else []
     nested = bool(retire_manifest.get("nested", False))
     installed_log = output_dir / "INSTALLED.txt"
     installed: list[Path] = []
@@ -122,12 +137,10 @@ def _run_install(args: argparse.Namespace) -> None:
             f"{app}: +{len(squash_paths)} squashes  ~{s_count} retired  -{d_count} cycle-break  max->{leaf or '(empty)'}\n"
         )
 
-    removed_file = Config.from_settings().removed_dependencies_file
-    if removed_file and removed_edges:
-        removed_path = project_root() / removed_file
+    if removed_path and removed_edges:
         # Uninstall restores a tracked list from git and deletes a new one.
         (deleted if removed_path.exists() else installed).append(removed_path)
-        _record_removed_dependencies(removed_path, removed_edges, retire_manifest.get("cutoff", ""))
+        _record_removed_dependencies(removed_path, removed_ledger, removed_edges, retire_manifest.get("cutoff", ""))
         sys.stderr.write(f"recorded {len(removed_edges)} removed dependency entries in {removed_path}\n")
 
     installed_log.write_text(
