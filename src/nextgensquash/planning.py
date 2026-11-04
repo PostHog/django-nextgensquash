@@ -146,6 +146,32 @@ class Squasher:
                 self.young[m.ref.key] = m
                 need -= 1
 
+    def _renamed_move_sources(self) -> list[tuple[str, str]]:
+        """Source halves of folded moves whose destination creates a model no folded
+        state-only delete names. Without the source, the destination squash
+        never creates the table on a fresh database, so a destination without
+        one is refused."""
+        moved_out = {name for m in self.old.values() for op in m.operations for name in op.moved_out}
+        sources: list[tuple[str, str]] = []
+        for m in self.old.values():
+            unmatched = sorted({n for op in m.operations for n in op.moved_in} - moved_out)
+            if not unmatched:
+                continue
+            found = [
+                dep.key
+                for dep in m.dependencies
+                if dep.app != m.ref.app
+                and dep.key in self.old
+                and any(op.moved_out for op in self.old[dep.key].operations)
+            ]
+            if not found:
+                raise RuntimeError(
+                    f"{m.ref} moves {', '.join(unmatched)} in, but no folded migration it depends on "
+                    "moves a model out; bump the cutoff past the move"
+                )
+            sources.extend(found)
+        return sources
+
     def _keep_state_moves_young(self) -> None:
         """Move both halves of each folded cross-app model move young, with
         every folded migration that depends on them.
@@ -157,6 +183,9 @@ class Squasher:
         second time. With the move young, the source squash keeps the model
         and the move runs as a plain migration on every database. A move
         behind a prior squash is not visible here and stays folded.
+
+        Halves pair by model name. A move that renames the model pairs through
+        the destination's dependency on the source half instead.
         """
         moved_in = {name for m in self.old.values() for op in m.operations for name in op.moved_in}
         if not moved_in:
@@ -166,6 +195,7 @@ class Squasher:
             for m in self.old.values()
             if any(op.moved_in or moved_in.intersection(op.moved_out) for op in m.operations)
         ]
+        pending.extend(self._renamed_move_sources())
         # A run_before entry is a dependency written on the other side.
         children: dict[tuple[str, str], list[tuple[str, str]]] = defaultdict(list)
         for m in self.old.values():

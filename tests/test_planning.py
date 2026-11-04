@@ -207,11 +207,12 @@ def test_nesting_prior_squashes_is_refused_before_django_6(monkeypatch):
         planning.Squasher(tree, CUTOFF, nest_prior_squashes=True)
 
 
-def test_nested_squash_keeps_a_cross_app_model_move_young(make_migration, monkeypatch):
+@pytest.mark.parametrize("moved_in_name", ["thing", "widget"])  # a move may rename the model
+def test_nested_squash_keeps_a_cross_app_model_move_young(make_migration, monkeypatch, moved_in_name):
     # The planning runs on any Django; only migrating a nested squash needs 6.0.
     monkeypatch.setattr(planning.django, "VERSION", (6, 0, 0, "final", 0))
     move_out = loading.OpInfo(kind="SeparateDatabaseAndState", moved_out=("thing",))
-    move_in = loading.OpInfo(kind="SeparateDatabaseAndState", moved_in=("thing",))
+    move_in = loading.OpInfo(kind="SeparateDatabaseAndState", moved_in=(moved_in_name,))
     migs = [
         make_migration("src", "0001_initial", commit_date=OLD_DATE),
         make_migration("src", "0002_create_thing", commit_date=OLD_DATE),
@@ -241,3 +242,16 @@ def test_nested_squash_keeps_a_cross_app_model_move_young(make_migration, monkey
         "other.0002_fk_to_thing",
         "src.0003_move_thing_out",
     ]
+
+
+def test_nested_squash_refuses_a_renamed_move_in_without_its_source(make_migration, monkeypatch):
+    monkeypatch.setattr(planning.django, "VERSION", (6, 0, 0, "final", 0))
+    move_in = loading.OpInfo(kind="SeparateDatabaseAndState", moved_in=("widget",))
+    migs = [
+        make_migration("dest", "0001_initial", commit_date=OLD_DATE),
+        make_migration("dest", "0002_move_widget_in", commit_date=OLD_DATE, operations=[move_in]),
+    ]
+    tree = loading.MigrationTree({m.ref.key: m for m in migs}, Config())
+
+    with pytest.raises(RuntimeError, match="moves widget in"):
+        planning.Squasher(tree, CUTOFF, min_young=0, nest_prior_squashes=True)
