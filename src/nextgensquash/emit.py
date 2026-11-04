@@ -784,12 +784,43 @@ class Emitter:
                 out |= self._storage_param_keys(op.sql or "")
         return out
 
+    _STORAGE_PARAMS_PARTS_RE = re.compile(
+        r"^(ALTER\s+TABLE\s+(?:ONLY\s+)?\"?([a-zA-Z0-9_]+)\"?\s+(?:SET|RESET)\s*\()([^)]*)(\).*)$",
+        re.IGNORECASE | re.DOTALL,
+    )
+
+    @classmethod
+    def _without_young_params(cls, stmt: str, young_keys: set[tuple[str, str]]) -> tuple[str | None, list[str]]:
+        """The storage statement without the parameters young migrations change, and the removed names.
+
+        The statement is None when every parameter is removed, and unchanged when none is.
+        """
+        match = cls._STORAGE_PARAMS_PARTS_RE.match(stmt)
+        if match is None:
+            return stmt, []
+        head, table, inside, tail = match.groups()
+        kept: list[str] = []
+        overridden: list[str] = []
+        for part in inside.split(","):
+            if not part.strip():
+                continue
+            name = part.split("=", 1)[0].strip().lower()
+            if (table.lower(), name) in young_keys:
+                overridden.append(name)
+            else:
+                kept.append(part.strip())
+        if not overridden:
+            return stmt, []
+        if not kept:
+            return None, overridden
+        return f"{head}{', '.join(kept)}{tail}", overridden
+
     def _storage_params_op(
         self, mig_name: str, op: Any, statements: list[str], young_keys: set[tuple[str, str]]
     ) -> Any | None:
         """The forwarded storage statements as one RunSQL, or None when nothing is left to forward.
 
-        Statements that young migrations override are left out. The original
+        Parameters that young migrations change are left out. The original
         `lock_timeout` is kept as a session setting, because the non-atomic
         addons file gives `SET LOCAL` no transaction to live in.
         """
@@ -798,10 +829,13 @@ class Emitter:
             return None
         forwarded = []
         for stmt in statements:
-            if self._storage_param_keys(stmt) & young_keys:
-                self.dropped_runsql.append(f"{self.app}.{mig_name} [young-override]: {stmt[:160]}")
-            else:
-                forwarded.append(stmt)
+            kept_stmt, overridden = self._without_young_params(stmt, young_keys)
+            if overridden:
+                self.dropped_runsql.append(
+                    f"{self.app}.{mig_name} [young-override]: {', '.join(overridden)} in {stmt[:160]}"
+                )
+            if kept_stmt is not None:
+                forwarded.append(kept_stmt)
         if not forwarded:
             return None
         sql = ";\n".join(forwarded) + ";"
@@ -814,7 +848,7 @@ class Emitter:
             sql = f"SET lock_timeout = {lock_timeout};\n{sql}\nRESET lock_timeout;"
         # SET and RESET of a storage parameter give the same result on every run,
         # so they need no existence guard. Noop reverse, as for the forwarded FK adds.
-        return dj_migrations.RunSQL(sql=sql, reverse_sql=dj_migrations.RunSQL.noop)
+        return dj_migrations.RunSQL(sql=sql, reverse_sql=dj_migrations.RunSQL.noop, hints=op.hints)
 
     _STANDALONE_VALIDATE_RE = re.compile(
         r"^ALTER\s+TABLE\s+(?:ONLY\s+)?\"?[a-zA-Z0-9_]+\"?\s+VALIDATE\s+CONSTRAINT\s+\"?([a-zA-Z0-9_]+)\"?$",

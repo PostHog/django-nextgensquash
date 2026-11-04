@@ -258,36 +258,36 @@ def test_initial_claims_prior_squash_members_only_when_flat(
     assert {("app", "0011_x"), ("app", "0005_deep")} <= set(emitter.folded_keys(emit_stub=True))
 
 
+def _storage_sql(params: str) -> list[str]:
+    return [f"SET lock_timeout = '5s';\nALTER TABLE app_thing SET ({params});\nRESET lock_timeout;"]
+
+
 @pytest.mark.parametrize(
     ("table", "young_sql", "forwarded"),
     [
-        (
-            "app_thing",
-            None,
-            [
-                "SET lock_timeout = '5s';\nALTER TABLE app_thing SET (autovacuum_vacuum_scale_factor = 0.02);\n"
-                "RESET lock_timeout;"
-            ],
-        ),
+        ("app_thing", None, _storage_sql("autovacuum_vacuum_scale_factor = 0.02, fillfactor = 70")),
         ("app_gone", None, []),  # a table the squash does not create
-        # schema_addons runs after the young chain, so the old value would overwrite the young reset.
-        ("app_thing", "ALTER TABLE app_thing RESET (autovacuum_vacuum_scale_factor)", []),
+        # schema_addons runs after the young chain, so an old value would overwrite the young change.
+        ("app_thing", "ALTER TABLE app_thing RESET (autovacuum_vacuum_scale_factor)", _storage_sql("fillfactor = 70")),
+        ("app_thing", "ALTER TABLE app_thing SET (fillfactor = 80, autovacuum_vacuum_scale_factor = 0.1)", []),
         (
             "app_thing",
-            "ALTER TABLE app_thing SET (fillfactor = 80)",
-            [
-                "SET lock_timeout = '5s';\nALTER TABLE app_thing SET (autovacuum_vacuum_scale_factor = 0.02);\n"
-                "RESET lock_timeout;"
-            ],
+            "ALTER TABLE app_other SET (fillfactor = 80)",
+            _storage_sql("autovacuum_vacuum_scale_factor = 0.02, fillfactor = 70"),
         ),
     ],
 )
 def test_storage_parameters_are_forwarded_for_tables_the_squash_creates(monkeypatch, table, young_sql, forwarded):
-    sql = f"SET LOCAL lock_timeout = '5s';\nALTER TABLE {table} SET (autovacuum_vacuum_scale_factor = 0.02)"
+    sql = f"SET LOCAL lock_timeout = '5s';\nALTER TABLE {table} SET (autovacuum_vacuum_scale_factor = 0.02, fillfactor = 70)"
+    hints = {"model_name": "thing"}
 
-    ops = _forwarder(monkeypatch, [("0178", migrations.RunSQL(sql))], young_sql)._collect_index_runsql_ops()
+    ops = _forwarder(
+        monkeypatch, [("0178", migrations.RunSQL(sql, hints=hints))], young_sql
+    )._collect_index_runsql_ops()
 
     assert [op.sql for op in ops] == forwarded
+    # A router may pick the database from the hints.
+    assert all(op.hints == hints for op in ops)
 
 
 def test_parameterized_storage_parameters_are_left_out(monkeypatch):
