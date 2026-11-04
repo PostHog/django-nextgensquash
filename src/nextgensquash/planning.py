@@ -146,16 +146,18 @@ class Squasher:
                 self.young[m.ref.key] = m
                 need -= 1
 
-    def _renamed_move_sources(self) -> list[tuple[str, str]]:
-        """Source halves of folded moves whose destination creates a model no folded
-        state-only delete names. Without the source, the destination squash
-        never creates the table on a fresh database, so a destination without
-        one is refused."""
+    def _move_sources_by_dependency(self) -> list[tuple[str, str]]:
+        """Source halves of folded moves, found through each destination's dependency
+        on a cross-app migration that moves a model out. A move can rename the
+        model, and an unrelated move can delete a model with the new name, so
+        the names alone do not pair the halves. A destination whose names match
+        no folded delete and that has no such dependency is refused: without
+        the source, no squash creates the table on a fresh database."""
         moved_out = {name for m in self.old.values() for op in m.operations for name in op.moved_out}
         sources: list[tuple[str, str]] = []
         for m in self.old.values():
-            unmatched = sorted({n for op in m.operations for n in op.moved_in} - moved_out)
-            if not unmatched:
+            moved_in = {n for op in m.operations for n in op.moved_in}
+            if not moved_in:
                 continue
             found = [
                 dep.key
@@ -164,7 +166,8 @@ class Squasher:
                 and dep.key in self.old
                 and any(op.moved_out for op in self.old[dep.key].operations)
             ]
-            if not found:
+            unmatched = sorted(moved_in - moved_out)
+            if unmatched and not found:
                 raise RuntimeError(
                     f"{m.ref} moves {', '.join(unmatched)} in, but no folded migration it depends on "
                     "moves a model out; bump the cutoff past the move"
@@ -184,8 +187,8 @@ class Squasher:
         and the move runs as a plain migration on every database. A move
         behind a prior squash is not visible here and stays folded.
 
-        Halves pair by model name. A move that renames the model pairs through
-        the destination's dependency on the source half instead.
+        Halves pair by model name and through the destination's dependency
+        on the source half.
         """
         moved_in = {name for m in self.old.values() for op in m.operations for name in op.moved_in}
         if not moved_in:
@@ -195,7 +198,7 @@ class Squasher:
             for m in self.old.values()
             if any(op.moved_in or moved_in.intersection(op.moved_out) for op in m.operations)
         ]
-        pending.extend(self._renamed_move_sources())
+        pending.extend(self._move_sources_by_dependency())
         # A run_before entry is a dependency written on the other side.
         children: dict[tuple[str, str], list[tuple[str, str]]] = defaultdict(list)
         for m in self.old.values():

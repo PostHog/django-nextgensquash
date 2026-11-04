@@ -255,3 +255,41 @@ def test_nested_squash_refuses_a_renamed_move_in_without_its_source(make_migrati
 
     with pytest.raises(RuntimeError, match="moves widget in"):
         planning.Squasher(tree, CUTOFF, min_young=0, nest_prior_squashes=True)
+
+
+def test_nested_squash_pairs_renamed_moves_whose_names_collide(make_migration, monkeypatch):
+    # src_a.Thing -> dest_a.Widget, and an unrelated src_b.Widget -> dest_b.Gadget.
+    monkeypatch.setattr(planning.django, "VERSION", (6, 0, 0, "final", 0))
+
+    def move(name: str, moved_in: str = "", moved_out: str = "") -> loading.Migration:
+        app, mig = name.split(".")
+        op = loading.OpInfo(
+            kind="SeparateDatabaseAndState",
+            moved_in=(moved_in,) if moved_in else (),
+            moved_out=(moved_out,) if moved_out else (),
+        )
+        return make_migration(app, mig, commit_date=OLD_DATE, operations=[op])
+
+    migs = [
+        make_migration("src_a", "0001_initial", commit_date=OLD_DATE),
+        move("src_a.0002_move_thing_out", moved_out="thing"),
+        make_migration("dest_a", "0001_initial", commit_date=OLD_DATE),
+        move("dest_a.0002_move_widget_in", moved_in="widget"),
+        make_migration("src_b", "0001_initial", commit_date=OLD_DATE),
+        move("src_b.0002_move_widget_out", moved_out="widget"),
+        make_migration("dest_b", "0001_initial", commit_date=OLD_DATE),
+        move("dest_b.0002_move_gadget_in", moved_in="gadget"),
+    ]
+    by_name = {f"{m.ref.app}.{m.ref.name}": m for m in migs}
+    by_name["dest_a.0002_move_widget_in"].dependencies = [by_name["src_a.0002_move_thing_out"].ref]
+    by_name["dest_b.0002_move_gadget_in"].dependencies = [by_name["src_b.0002_move_widget_out"].ref]
+    tree = loading.MigrationTree({m.ref.key: m for m in migs}, Config())
+
+    squasher = planning.Squasher(tree, CUTOFF, min_young=0, nest_prior_squashes=True)
+
+    assert sorted(f"{a}.{n}" for a, n in squasher.young) == [
+        "dest_a.0002_move_widget_in",
+        "dest_b.0002_move_gadget_in",
+        "src_a.0002_move_thing_out",
+        "src_b.0002_move_widget_out",
+    ]
