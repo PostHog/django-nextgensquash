@@ -5,10 +5,12 @@ from __future__ import annotations
 import functools
 import re
 from collections import defaultdict
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import date
 from typing import Any
 
+import django
 import networkx as nx
 from django.db.migrations.loader import MigrationLoader
 from django.db.migrations.state import ProjectState
@@ -32,6 +34,29 @@ class ProposedSquash:
     dropped_runpythons: list[DroppedRunPython]
 
 
+def replaced_closure(
+    migrations: Iterable[loading.Migration], hidden: dict[tuple[str, str], loading.Migration]
+) -> set[tuple[str, str]]:
+    """Every name the given migrations replace, at any depth.
+
+    Django 6 resolves a squash that replaces a squash recursively, so a file
+    behind a squash that is itself behind a squash still hands its edges to the
+    new fold, and its name is still recorded on live databases. A name without a
+    file on disk ends the walk there.
+    """
+    seen: set[tuple[str, str]] = set()
+    pending = [r.key for m in migrations for r in m.replaces]
+    while pending:
+        key = pending.pop()
+        if key in seen:
+            continue
+        seen.add(key)
+        member = hidden.get(key)
+        if member is not None:
+            pending.extend(r.key for r in member.replaces)
+    return seen
+
+
 class Squasher:
     """Plans a new migration tree given an old/young partition."""
 
@@ -41,9 +66,15 @@ class Squasher:
         cutoff: date,
         include_prior_squashes: bool = True,
         min_young: int = 3,
+        nest_prior_squashes: bool = False,
     ):
+        if nest_prior_squashes and django.VERSION < (6, 0):
+            # Django 5.2 walks replacements in set order, so a squash that
+            # replaces a squash crashes the loader on about half the hash seeds.
+            raise RuntimeError("nesting prior squashes needs Django 6.0 or later")
         self.tree = tree
         self.cutoff = cutoff
+        self.nest_prior_squashes = nest_prior_squashes
         # Dated name matches `Emitter.INITIAL_NAME` — same value, different
         # entry point (plan/preview vs actual file emission).
         self.SQUASH_NAME = f"0001_squash_{cutoff.isoformat().replace('-', '_')}_initial"
@@ -52,9 +83,13 @@ class Squasher:
         # Files on disk behind a prior squash in the old set. The fold claims
         # them too, and a prior squash never moves young, so this stays fixed.
         self.hidden_folded = {
-            r.key: tree.hidden[r.key] for m in self.old.values() for r in m.replaces if r.key in tree.hidden
+            key: tree.hidden[key]
+            for key in sorted(replaced_closure(self.old.values(), tree.hidden))
+            if key in tree.hidden
         }
         self._rebalance_min_young(min_young)
+        if nest_prior_squashes:
+            self._keep_state_moves_young()
         self._pull_sql_referenced_young()
         self._check_run_before_direction()
         self.migration_graph = self._build_migration_graph()
@@ -110,6 +145,80 @@ class Squasher:
                 del self.old[m.ref.key]
                 self.young[m.ref.key] = m
                 need -= 1
+
+    def _move_sources_by_dependency(self) -> list[tuple[str, str]]:
+        """Source halves of folded moves, found through each destination's dependency
+        on a cross-app migration that moves a model out. A move can rename the
+        model, and an unrelated move can delete a model with the new name, so
+        the names alone do not pair the halves. A destination whose names match
+        no folded delete and that has no such dependency is refused: without
+        the source, no squash creates the table on a fresh database."""
+        moved_out = {name for m in self.old.values() for op in m.operations for name in op.moved_out}
+        sources: list[tuple[str, str]] = []
+        for m in self.old.values():
+            moved_in = {n for op in m.operations for n in op.moved_in}
+            if not moved_in:
+                continue
+            found = [
+                dep.key
+                for dep in m.dependencies
+                if dep.app != m.ref.app
+                and dep.key in self.old
+                and any(op.moved_out for op in self.old[dep.key].operations)
+            ]
+            unmatched = sorted(moved_in - moved_out)
+            if unmatched and not found:
+                raise RuntimeError(
+                    f"{m.ref} moves {', '.join(unmatched)} in, but no folded migration it depends on "
+                    "moves a model out; bump the cutoff past the move"
+                )
+            sources.extend(found)
+        return sources
+
+    def _keep_state_moves_young(self) -> None:
+        """Move both halves of each folded cross-app model move young, with
+        every folded migration that depends on them.
+
+        The squashes fold per app, and Django uses a squash only when all or
+        none of its replaced names are applied. A database that stopped before
+        the move created the table in the source app, but has applied nothing
+        in the destination app, so the destination squash creates the table a
+        second time. With the move young, the source squash keeps the model
+        and the move runs as a plain migration on every database. A move
+        behind a prior squash is not visible here and stays folded.
+
+        Halves pair by model name and through the destination's dependency
+        on the source half.
+        """
+        moved_in = {name for m in self.old.values() for op in m.operations for name in op.moved_in}
+        if not moved_in:
+            return
+        pending = [
+            m.ref.key
+            for m in self.old.values()
+            if any(op.moved_in or moved_in.intersection(op.moved_out) for op in m.operations)
+        ]
+        pending.extend(self._move_sources_by_dependency())
+        # A run_before entry is a dependency written on the other side.
+        children: dict[tuple[str, str], list[tuple[str, str]]] = defaultdict(list)
+        for m in self.old.values():
+            for dep in m.dependencies:
+                children[dep.key].append(m.ref.key)
+            for rb in m.run_before:
+                children[m.ref.key].append(rb.key)
+        to_move: set[tuple[str, str]] = set()
+        while pending:
+            key = pending.pop()
+            if key in to_move or key not in self.old:
+                continue
+            to_move.add(key)
+            pending.extend(children[key])
+        for key in sorted(to_move):
+            m = self.old[key]
+            if m.replaces:
+                raise RuntimeError(f"{m.ref} depends on a cross-app model move but is a prior squash; bump the cutoff")
+            del self.old[key]
+            self.young[key] = m
 
     def max_number(self, app: str) -> int:
         """Highest numeric prefix among the app's migrations, old and young; 0 when none."""
